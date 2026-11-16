@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+hf.env
+*.safetensors
+/data/
+/models/
+/runs/
+/work/
+/venv/
+/export/
+/logs/
+/state/

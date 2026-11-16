@@ -1,0 +1,8 @@
+# engine (pinned by the competition kit)
+vllm==0.31.0
+# offline data generation / training
+accelerate
+datasets
+safetensors
+numpy
+huggingface_hub
