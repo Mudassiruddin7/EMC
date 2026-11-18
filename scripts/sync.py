@@ -55,7 +55,20 @@ def scrub_copy(src: Path, dst: Path):
         shutil.copy(src, dst)
 
 
+def record_stats():
+    """Append a machine snapshot (memory, disk, GPU) to logs/stats.log; never blocks an upload."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from sysstats import snapshot
+        (ROOT / "logs").mkdir(parents=True, exist_ok=True)
+        with open(ROOT / "logs" / "stats.log", "a") as f:
+            f.write(snapshot(ROOT) + "\n")
+    except Exception as e:  # noqa: BLE001
+        print(f"machine stats unavailable: {e}")
+
+
 def main():
+    record_stats()
     tok = token()
     if not tok:
         print("no Hugging Face token: skipping upload")

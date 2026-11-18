@@ -29,11 +29,13 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGS/pipeline.log"; }
 sync_hf() { if [ -x "$PY" ]; then "$PY" "$REPO/scripts/sync.py" "$@" >> "$LOGS/sync.log" 2>&1 || true; fi; }
 is_done() { [ -f "$STATE/$1.done" ]; }
+stats() { if [ -x "$PY" ]; then "$PY" "$REPO/scripts/sysstats.py" "$EMC_ROOT" >> "$LOGS/stats.log" 2>/dev/null || true; fi; }
 
 stage() {  # stage <name> <required: 0|1> <function>
   local name=$1 required=$2 fn=$3 t0=$SECONDS rc
   if is_done "$name"; then log "skip  $name (done)"; return 0; fi
   log "start $name"
+  stats
   ( set -e; "$fn" ) > "$LOGS/$name.log" 2>&1
   rc=$?
   if [ "$rc" = 0 ]; then
@@ -134,6 +136,8 @@ s_eval_alt() {
 s_report() { "$PY" "$REPO/scripts/collect.py"; }
 
 log "pipeline start: run $(cat "$STATE/run_id"), code $(cat "$REPO/.commit" 2>/dev/null | cut -c1-12)"
+# a vLLM server left behind by an interrupted run would still hold the GPU
+if pkill -f -- "--served-model-name target" 2>/dev/null; then log "stopped a leftover vLLM server"; sleep 20; fi
 stage env 1 s_env
 stage download 1 s_download
 stage baseline 1 s_baseline

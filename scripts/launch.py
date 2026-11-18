@@ -66,7 +66,7 @@ def alive(pidfile):
 
 
 def status(root):
-    print(f"working folder : {root}  ({shutil.disk_usage(root).free / 1e9:.0f} GB free)")
+    print(f"working folder : {root}  ({shutil.disk_usage(root).used / 1e9:.0f} GB used)")
     print(f"supervisor     : {'running' if alive(root / 'supervisor.pid') else 'not running'}")
     try:
         print("GPU            :", subprocess.run(["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu",
@@ -74,6 +74,13 @@ def status(root):
                                                  timeout=20).stdout.strip())
     except Exception:  # noqa: BLE001
         pass
+    stats = root / "repo" / "scripts" / "sysstats.py"
+    if stats.exists():
+        try:
+            print("machine        :", subprocess.run([sys.executable, str(stats), str(root)], capture_output=True,
+                                                     text=True, timeout=60).stdout.strip())
+        except Exception:  # noqa: BLE001
+            pass
     done = sorted(p.stem for p in (root / "state").glob("*.done"))
     failed = sorted(p.stem for p in (root / "state").glob("*.failed"))
     print("stages done    :", " ".join(done) or "-")
