@@ -102,6 +102,15 @@ Raw kit outputs, per-stage logs, machine statistics and training summaries are i
 dataset repo under `runs/r1/` and `runs/r2/`; the r2 draft folders (FP8 and bf16, each with
 `model.safetensors`) under `submissions/r2/`.
 
+## Phase 2 submission
+
+The r2 FP8 draft is in a gated Hugging Face model repository (manual approval, organizers
+only), identical to `submissions/r2/main-fp8` and passing `emc2 validate`:
+
+```
+mudassiruddin21/EMC-Qwen3.8-27B-MTP-FP8@21a87b7316a9217c32f840223ccf5ca61001dafb
+```
+
 ## Layout
 
 ```
