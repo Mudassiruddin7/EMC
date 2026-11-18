@@ -22,6 +22,8 @@ export UV_CACHE_DIR="$EMC_ROOT/uv-cache" UV_PYTHON_INSTALL_DIR="$EMC_ROOT/uv-pyt
 export EMC2_HOME="$KIT" EMC_RESULTS="$RESULTS"
 export XDG_CACHE_HOME="$WORK/cache" VLLM_CACHE_ROOT="$WORK/cache/vllm" VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
 export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/inductor" TRITON_CACHE_DIR="$WORK/cache/triton"
+# greedy decoding only: use the built-in sampler instead of compiling FlashInfer kernels at start-up
+export VLLM_USE_FLASHINFER_SAMPLER=0
 [ -f "$STATE/run_id" ] || echo "${RUN_ID:-$(date +%Y%m%d-%H%M)}" > "$STATE/run_id"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGS/pipeline.log"; }
