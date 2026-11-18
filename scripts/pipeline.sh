@@ -20,6 +20,8 @@ export TOKENIZERS_PARALLELISM=false HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_DISABLE_PR
 export HF_HOME="$EMC_ROOT/hf" HF_XET_CHUNK_CACHE_SIZE_BYTES=0 TMPDIR="$EMC_ROOT/tmp"
 export UV_CACHE_DIR="$EMC_ROOT/uv-cache" UV_PYTHON_INSTALL_DIR="$EMC_ROOT/uv-python" UV_LINK_MODE=copy
 export EMC2_HOME="$KIT" EMC_RESULTS="$RESULTS"
+export XDG_CACHE_HOME="$WORK/cache" VLLM_CACHE_ROOT="$WORK/cache/vllm" VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
+export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/inductor" TRITON_CACHE_DIR="$WORK/cache/triton"
 [ -f "$STATE/run_id" ] || echo "${RUN_ID:-$(date +%Y%m%d-%H%M)}" > "$STATE/run_id"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGS/pipeline.log"; }
