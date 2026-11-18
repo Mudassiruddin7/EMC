@@ -25,6 +25,7 @@ export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/inductor" TRITON_CACHE_DIR="$WORK/ca
 # greedy decoding only: use the built-in sampler instead of compiling FlashInfer kernels at start-up
 export VLLM_USE_FLASHINFER_SAMPLER=0
 [ -f "$STATE/run_id" ] || echo "${RUN_ID:-$(date +%Y%m%d-%H%M)}" > "$STATE/run_id"
+if [ -n "${RUN_ID_FORCE:-}" ]; then echo "$RUN_ID_FORCE" > "$STATE/run_id"; fi   # e.g. a new run on a fresh machine
 # training run name (runs/<name>), its starting weights and whether to also evaluate the bf16 variant
 RUN_NAME="${RUN_NAME:-main}"; TRAIN_INIT="${TRAIN_INIT:-$BASELINE}"; EVAL_ALT="${EVAL_ALT:-1}"
 case "$TRAIN_INIT" in /*) ;; *) TRAIN_INIT="$EMC_ROOT/$TRAIN_INIT" ;; esac
@@ -64,7 +65,11 @@ kit() {  # the official kit commands (scripts/kit.py only maps its container pat
 s_env() {
   nvidia-smi || true
   df -h "$EMC_ROOT" || true; free -g || true; nproc || true
-  [ -x "$PY" ] || "$UV" venv --python 3.12 "$VENV"
+  # a Python install or environment left half-present by a machine reset is rebuilt
+  for d in "$UV_PYTHON_INSTALL_DIR"/cpython-3.12*; do
+    if [ -d "$d" ] && [ ! -x "$d/bin/python3.12" ]; then echo "removing incomplete $d"; rm -rf "$UV_PYTHON_INSTALL_DIR"; break; fi
+  done
+  if ! "$PY" -c "import sys" >/dev/null 2>&1; then rm -rf "$VENV"; "$UV" venv --python 3.12 "$VENV"; fi
   "$UV" pip install --python "$PY" "vllm==0.31.0" accelerate datasets
   "$UV" cache clean >/dev/null 2>&1 || true
   "$PY" - <<'EOF'
