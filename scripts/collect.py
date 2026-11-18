@@ -49,7 +49,8 @@ def main():
                     + " / ".join(f"{m['acceptance_by_domain'].get(d, 0) or 0:.2f}" for d in ("chat", "code", "math", "longform"))
                     + f" | {m['tpot_median_s'] * 1000:.2f} | {m['memory_bytes'] / 1e9:.3f} | "
                     + (f"{off:.1f}" if off is not None else "-") + " | " + (f"{same:.1f}" if same is not None else "-") + " |")
-    for p in sorted(RES.glob("*_checks.json")) + sorted(RES.glob("generation.json")):
+    extra = ["*_checks.json", "generation.json", "ablation.json", "choice.json", "bench_*.json"]
+    for p in [q for pat in extra for q in sorted(RES.glob(pat))]:
         out[p.stem] = json.loads(p.read_text())
     for p in sorted(ROOT.glob("runs/*/train_summary.json")):
         t = json.loads(p.read_text())

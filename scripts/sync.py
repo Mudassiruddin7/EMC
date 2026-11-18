@@ -101,8 +101,13 @@ def main():
                 except Exception as e:  # noqa: BLE001
                     print(f"could not list the repository: {e}")
             for sub in subs:
+                # a training run records which run it belongs to; folders without that record
+                # (older runs, or starting weights fetched from the Hub) are not uploaded again
+                marker = sub.parent / "run_id"
+                if not marker.exists():
+                    continue
                 name = f"{sub.parent.name}-{sub.name[4:]}"
-                dest = f"submissions/{run_id}/{name}"
+                dest = f"submissions/{marker.read_text().strip()}/{name}"
                 missing = [p.name for p in sub.iterdir() if p.is_file() and f"{dest}/{p.name}" not in have]
                 if "--submissions" in sys.argv or missing:
                     info = api.upload_folder(folder_path=str(sub), repo_id=REPO_ID, repo_type="dataset",

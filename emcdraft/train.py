@@ -32,9 +32,12 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def head_loss(o, W, y, w, teach, beta, chunk=2048):
+def head_loss(o, W, y, w, teach, beta, chunk=2048, topk=0):
     """Weighted CE (+ beta * soft-target CE) through the frozen LM head, in memory-bounded
-    chunks. Returns a surrogate whose gradient w.r.t. `o` equals the loss gradient."""
+    chunks. Returns a surrogate whose gradient w.r.t. `o` equals the loss gradient.
+
+    topk > 0 restricts the soft target to the target's `topk` most likely tokens (the
+    "harmonized objective distillation" of HASS): -sum_{t in top-k(p)} p(t) log q(t)."""
     n = o.shape[0]
     denom = w.sum().clamp(min=1.0)
     surrogate = torch.zeros((), device=o.device)
@@ -49,8 +52,14 @@ def head_loss(o, W, y, w, teach, beta, chunk=2048):
         loss = (ce * w[s:e]).sum()
         if teach is not None and beta > 0:
             with torch.no_grad():
-                tp = F.softmax(F.linear(teach[s:e], W.to(teach.dtype)).float(), -1)
-            loss = loss + beta * (-(tp * logp).sum(-1) * w[s:e]).sum()
+                tl = F.linear(teach[s:e], W.to(teach.dtype)).float()
+                if topk:
+                    ix = tl.topk(topk, -1).indices
+                    tp = F.softmax(tl, -1).gather(-1, ix)
+                else:
+                    tp = F.softmax(tl, -1)
+            lq = logp.gather(-1, ix) if topk else logp
+            loss = loss + beta * (-(tp * lq).sum(-1) * w[s:e]).sum()
         (g,) = torch.autograd.grad(loss / denom, z)
         surrogate = surrogate + (o[s:e].float() * g.float()).sum()
         ce_sum += float((ce.detach() * w[s:e]).sum())
@@ -74,8 +83,9 @@ def train_step(head, embed, W, batch, a, K=3):
             bi, ni = valid.nonzero(as_tuple=True)
             # the target's own distribution for the same token: h_{i+k} predicts x_{i+k+1}
             teach = hidden[bi, (ni + k).clamp(max=N - 1)] if a.beta > 0 else None
-            s_k, ce_k, corr = head_loss(out[bi, ni], W, labels[bi, ni], w[bi, ni], teach, a.beta)
-            total = total + a.step_w[k - 1] * s_k
+            s_k, ce_k, corr = head_loss(out[bi, ni], W, labels[bi, ni], w[bi, ni], teach, a.beta,
+                                        topk=getattr(a, "topk", 0))
+            total = total + getattr(a, "step_w_cur", a.step_w)[k - 1] * s_k
             full = torch.zeros(B, N, dtype=torch.bool, device=tokens.device)
             full[bi, ni] = corr
             reach = valid if prev is None else valid & prev
@@ -113,13 +123,26 @@ def main():
     ap.add_argument("--batch-tokens", type=int, default=int(os.environ.get("TRAIN_BATCH_TOKENS", 8192)))
     ap.add_argument("--rel-lr", type=float, default=float(os.environ.get("TRAIN_REL_LR", 1e-3)),
                     help="peak Adam step as a fraction of each tensor's RMS")
-    ap.add_argument("--beta", type=float, default=0.5)
-    ap.add_argument("--floor", type=float, default=0.3)
-    ap.add_argument("--step-w", type=float, nargs=3, default=[1.0, 0.7, 0.5])
+    ap.add_argument("--beta", type=float, default=float(os.environ.get("TRAIN_BETA", 0.5)),
+                    help="weight of the soft-target (distillation) term")
+    ap.add_argument("--topk", type=int, default=int(os.environ.get("TRAIN_TOPK", 0)),
+                    help="distil only the target's top-k tokens (0: full distribution)")
+    ap.add_argument("--floor", type=float, default=float(os.environ.get("TRAIN_FLOOR", 0.3)),
+                    help="weight of later-step positions the engine would not reach")
+    ap.add_argument("--step-w", nargs="+", default=os.environ.get("TRAIN_STEP_W", "1 0.7 0.5").split(),
+                    help="three step weights, or 'auto': each step weighted by the derivative of the "
+                         "acceptance length with respect to its accuracy")
+    ap.add_argument("--max-steps", type=int, default=0, help="cap on optimizer steps (short ablation runs)")
+    ap.add_argument("--no-export", action="store_true", help="ablation run: no submission folders")
+    ap.add_argument("--quick", action="store_true", help="ablation run: simulate the validation set only")
     ap.add_argument("--eval-every", type=int, default=60)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--team", default=os.environ.get("TEAM_ID", "mudassiruddin"))
     a = ap.parse_args()
+    auto_w = [x.lower() for x in a.step_w] == ["auto"]
+    if not auto_w:
+        a.step_w = [float(x) for x in a.step_w]
+        assert len(a.step_w) == 3, "--step-w takes three numbers or 'auto'"
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     rng = random.Random(a.seed)
@@ -152,13 +175,13 @@ def main():
 
     def sims(tag):
         r = {"val": simulate(head, embed, W, val)}
-        if dev_seqs:
+        if dev_seqs and not a.quick:
             r["dev"] = simulate(head, embed, W, dev_seqs)
         summary["sim"][tag] = r
         log(f"[{tag}] val tau {r['val']['acceptance_length']:.4f}"
             + (f" | dev tau {r['dev']['acceptance_length']:.4f} "
                f"{ {d: round(v, 3) for d, v in r['dev']['acceptance_by_domain'].items()} } "
-               f"steps {[round(x, 3) for x in r['dev']['step_accuracy']]}" if dev_seqs else ""))
+               f"steps {[round(x, 3) for x in r['dev']['step_accuracy']]}" if "dev" in r else ""))
         return r
 
     sims("init")
@@ -175,7 +198,8 @@ def main():
         log(f"equalisation factors {summary['equalize']} (must be function-preserving)")
         if drift > 1e-2:
             raise SystemExit(f"equalisation changed the head's output (drift {drift:.3g})")
-        sims("equalized")
+        if not a.quick:
+            sims("equalized")
         head.set_fake_quant(True)
         sims("fp8_untrained")
 
@@ -187,11 +211,17 @@ def main():
 
     per_epoch = len(batches(train, a.batch_tokens))
     total_steps = max(1, int(per_epoch * a.epochs))
+    if a.max_steps:
+        total_steps = min(total_steps, a.max_steps)
     warm = max(5, total_steps // 30)
     key = "val"
-    best = {"tau": summary["sim"]["fp8_untrained" if a.qat else "init"][key]["acceptance_length"],
+    start = summary["sim"]["fp8_untrained" if a.qat else "init"][key]
+    best = {"tau": start["acceptance_length"],
             "step": 0, "state": {k: v.detach().clone() for k, v in head.state_dict().items()}}
-    log(f"training: {total_steps} steps planned ({per_epoch}/epoch), qat={a.qat}")
+    # running per-step conditional accuracies, for acceptance-aware step weights
+    acc_ema = list(start["step_accuracy"])
+    log(f"training: {total_steps} steps planned ({per_epoch}/epoch), qat={a.qat}, "
+        f"step weights {'auto' if auto_w else a.step_w}, top-k {a.topk}, floor {a.floor}, rel-lr {a.rel_lr}")
     step, t0, hist = 0, time.time(), []
     head.train()
     done = False
@@ -206,7 +236,13 @@ def main():
             f = (step + 1) / warm if step < warm else 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * (step - warm) / max(1, total_steps - warm)))
             for g in opt.param_groups:
                 g["lr"] = g["base"] * f
+            if auto_w:
+                # d tau / d a_k for tau = 1 + a1 + a1 a2 + a1 a2 a3, normalised to step 1
+                a1, a2, a3 = acc_ema
+                d = [1 + a2 + a2 * a3, a1 * (1 + a3), a1 * a2]
+                a.step_w_cur = [x / d[0] for x in d]
             loss, info = train_step(head, embed, W, collate(group, device=dev), a)
+            acc_ema = [0.98 * e + 0.02 * info[f"acc{k + 1}"] for k, e in enumerate(acc_ema)]
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
@@ -216,7 +252,8 @@ def main():
                 est = 1 + info["acc1"] * (1 + info["acc2"] * (1 + info["acc3"]))
                 log(f"step {step}/{total_steps} ce {info['ce1']:.3f}/{info['ce2']:.3f}/{info['ce3']:.3f} "
                     f"acc {info['acc1']:.3f}/{info['acc2']:.3f}/{info['acc3']:.3f} batch-tau~{est:.3f} "
-                    f"lr x{f:.2f} {(time.time() - t0) / step:.2f}s/step")
+                    f"lr x{f:.2f} {(time.time() - t0) / step:.2f}s/step"
+                    + (f" w {[round(x, 2) for x in a.step_w_cur]}" if auto_w else ""))
             if step % a.eval_every == 0 or step >= total_steps:
                 r = simulate(head, embed, W, val)
                 d = simulate(head, embed, W, dev_seqs[::4]) if dev_seqs else None
@@ -238,10 +275,18 @@ def main():
     summary["best_step"] = best["step"]
     summary["train_seconds"] = round(time.time() - t0, 1)
     log(f"best checkpoint: step {best['step']} (val tau {best['tau']:.4f})")
+    summary["best_val_tau"] = best["tau"]
+    if a.no_export:
+        summary["total_seconds"] = round(time.time() - t_start, 1)
+        (out / "train_summary.json").write_text(json.dumps(summary, indent=2, default=str))
+        log("ablation run finished (no export)")
+        return
 
     meta = {"team_id": a.team,
             "method_description": ("Replacement MTP head in the baseline layout, initialised from the target's "
                                    "built-in head and fine-tuned with a 3-step recursive drafting objective"
+                                   + (", acceptance-aware step weights" if auto_w else "")
+                                   + (f", top-{a.topk} distillation" if a.topk else "")
                                    + (" and FP8 (E4M3) quantisation-aware training" if a.qat else "")),
             "training_data": ("Greedy answers of the target itself (with its hidden states) to public "
                               "instruction prompts: GSM8K/Orca-Math, WritingPrompts, UltraChat/Alpaca/Dolly, "

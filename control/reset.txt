@@ -2,3 +2,4 @@
 # One per line: <unique id> [kill] <stage> [<stage> ...]   - each id is applied once;
 # "kill" stops a running pipeline first. Example:  r1-2 train eval_main
 r2 generate extract train eval_main report_main eval_alt report
+r3 generate extract ablate train eval_main report_main eval_alt eval_prev choose report bench_draft bench_baseline bench_target report_bench

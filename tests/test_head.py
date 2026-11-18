@@ -246,6 +246,74 @@ def test_append():
     print("  append: earlier answers and shards kept, new files only, same validation split")
 
 
+def test_recipes(head, E, W):
+    """The full training entry point with the new recipe options, the recipe comparison and
+    the keep-the-better-draft rule, end to end on a tiny fake target (CPU)."""
+    import subprocess
+    from emcdraft.head import save_safetensors_raw
+    from emcdraft.sim import save_shard
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ, PYTHONPATH=str(root), TRAIN_DATA_DEVICE="cpu")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tgt, init, data = tmp / "target", tmp / "init", tmp / "data"
+        tgt.mkdir()
+        (tgt / "config.json").write_text(json.dumps({"text_config": {
+            "hidden_size": C.hidden, "intermediate_size": C.inter, "num_attention_heads": C.heads,
+            "num_key_value_heads": C.kv_heads, "head_dim": C.head_dim, "partial_rotary_factor": C.rot_dim / C.head_dim,
+            "rope_theta": C.theta, "rms_norm_eps": C.eps, "max_position_embeddings": 262144,
+            "mtp_num_hidden_layers": 1}}))
+        names = {"lm_head.weight": W, "model.language_model.embed_tokens.weight": E}
+        save_safetensors_raw(tgt / "model.safetensors", {
+            n: ("BF16", t.shape, t.to(torch.bfloat16).contiguous().view(torch.int16).numpy().tobytes())
+            for n, t in names.items()})
+        (tgt / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {n: "model.safetensors" for n in names}}))
+        head.set_fake_quant(False)
+        export_submission(head, init, tgt / "config.json", False, {"team_id": "t", "method_description": "m", "training_data": "d"})
+        g = torch.Generator().manual_seed(3)
+        for split, n in (("train", 20), ("dev", 4)):
+            seqs = [{"tokens": torch.randint(0, V, (16,), generator=g), "hidden": torch.randn(15, C.hidden, generator=g),
+                     "P": 4, "domain": d, "id": f"{d}{i}"} for d in ("chat", "code", "math", "longform") for i in range(n)]
+            (data / split).mkdir(parents=True)
+            save_shard(str(data / split / ("g0000" if split == "train" else "all")), seqs)
+        common = ["--target", str(tgt), "--init", str(init), "--data", str(data / "train"), "--dev", str(data / "dev")]
+        run = lambda args: subprocess.run([sys.executable, "-m", *args], env=env, capture_output=True, text=True)
+        r = run(["emcdraft.train", *common, "--out", str(tmp / "full"), "--qat", "--step-w", "auto", "--topk", "5",
+                 "--floor", "0.1", "--max-steps", "4", "--eval-every", "2", "--batch-tokens", "200"])
+        assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
+        s = json.loads((tmp / "full" / "train_summary.json").read_text())
+        meta = json.loads((tmp / "full" / "sub_fp8" / "metadata.json").read_text())
+        assert "acceptance-aware" in meta["method_description"] and "top-5" in meta["method_description"]
+        assert len(s["history"]) == 2 and (tmp / "full" / "sub_bf16" / "model.safetensors").exists()
+        assert "w [" in r.stdout, "auto step weights not reported"
+        r = run(["emcdraft.ablate", *common, "--out", str(tmp / "abl"), "--results", str(tmp / "res"),
+                 "--state", str(tmp), "--qat", "--steps", "2"])
+        assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
+        ab = json.loads((tmp / "res" / "ablation.json").read_text())
+        assert set(ab["recipes"]) == {"control", "accw_topk", "accw_topk_mask", "accw_topk_lr2"}
+        assert (tmp / "train_args").read_text().split() == ab["recipes"][ab["chosen"]]["flags"]
+        assert not any((tmp / "abl" / n / "sub_fp8").exists() for n in ab["recipes"]), "ablation runs must not export"
+        # keep-the-better-draft rule
+        kit = os.environ.get("EMC2_HOME")
+        if kit:
+            res = tmp / "res"
+            m = lambda tau, tpot: {"acceptance_length": tau, "tpot_median_s": tpot, "memory_bytes": 607177728}
+            (res / "eval_baseline.json").write_text(json.dumps(dict(m(2.805, 0.01539), memory_bytes=916507648)))
+            (res / "eval_new.json").write_text(json.dumps(m(2.95, 0.0150)))
+            (res / "eval_old.json").write_text(json.dumps(m(2.90, 0.01524)))
+            ch = lambda new, old: subprocess.run([sys.executable, str(root / "scripts" / "choose.py"), "--new", new,
+                                                  "--new-sub", str(tmp / "full" / "sub_fp8"), "--prev", old,
+                                                  "--prev-sub", str(init), "--results", str(res), "--state", str(tmp)],
+                                                 env=env, capture_output=True, text=True)
+            r = ch("eval_new", "eval_old")
+            assert r.returncode == 0 and json.loads((res / "choice.json").read_text())["kept"] == "new", r.stderr
+            assert (tmp / "final_sub").read_text().strip() == str(tmp / "full" / "sub_fp8")
+            r = ch("eval_old", "eval_new")      # a worse new draft keeps the previous one
+            assert json.loads((res / "choice.json").read_text())["kept"] == "previous", r.stderr
+            assert (tmp / "final_sub").read_text().strip() == str(init)
+    print("  recipes: training options, recipe comparison and keep-the-better rule work end to end")
+
+
 if __name__ == "__main__":
     head = MTPHead(C)
     for p in head.parameters():
@@ -259,4 +327,5 @@ if __name__ == "__main__":
     print("train/export"); test_train_and_export(head, E, W)
     print("helpers"); test_helpers()
     print("append"); test_append()
+    print("recipes"); test_recipes(head, E, W)
     print("ALL OK")

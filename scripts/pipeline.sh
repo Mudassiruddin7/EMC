@@ -30,6 +30,9 @@ if [ -n "${RUN_ID_FORCE:-}" ]; then echo "$RUN_ID_FORCE" > "$STATE/run_id"; fi  
 RUN_NAME="${RUN_NAME:-main}"; TRAIN_INIT="${TRAIN_INIT:-$BASELINE}"; EVAL_ALT="${EVAL_ALT:-1}"
 case "$TRAIN_INIT" in /*) ;; *) TRAIN_INIT="$EMC_ROOT/$TRAIN_INIT" ;; esac
 OUTRUN="$RUNS/$RUN_NAME"
+# the previous best draft (kept unless the new one scores higher on this machine)
+PREV_TAG="${PREV_TAG:-}"; PREV_SUB="${PREV_SUB:-}"
+case "$PREV_SUB" in ""|/*) ;; *) PREV_SUB="$EMC_ROOT/$PREV_SUB" ;; esac
 if [ "$RUN_NAME" = main ]; then EVAL_PREFIX=eval_draft; else EVAL_PREFIX="eval_$RUN_NAME"; fi
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGS/pipeline.log"; }
@@ -130,10 +133,8 @@ s_smoke_base() { SUB="$BASELINE" TAG=smoke_baseline kit eval --limit-per-domain 
 s_prompts()  { "$PY" -m emcdraft.prompts --target "$TARGET" --kit "$KIT" --out "$DATA/prompts" --results "$RESULTS"; }
 s_generate() { "$PY" -m emcdraft.gen_vllm --target "$TARGET" --prompts "$DATA/prompts" --out "$DATA/gen" --results "$RESULTS"; }
 s_extract()  { "$PY" -m emcdraft.extract --target "$TARGET" --kit "$KIT" --baseline "$BASELINE" --gen "$DATA/gen" --out "$DATA" --results "$RESULTS"; }
-s_train() {
-  local qat=""; [ -f "$STATE/fp8_ok" ] && qat="--qat"
-  if [ ! -d "$TRAIN_INIT" ] && [ -n "${TRAIN_INIT_HF:-}" ]; then   # e.g. on a fresh machine
-    "$PY" - "$TRAIN_INIT_HF" "$TRAIN_INIT" <<'PYEOF'
+fetch_hf() {   # fetch_hf <dataset-repo>:<folder> <destination>: a draft folder from the dataset repo
+  "$PY" - "$1" "$2" <<'PYEOF'
 import shutil, sys
 from pathlib import Path
 from huggingface_hub import snapshot_download
@@ -141,12 +142,28 @@ repo, sub = sys.argv[1].split(":", 1)
 src = Path(snapshot_download(repo, repo_type="dataset", allow_patterns=[sub + "/*"])) / sub
 Path(sys.argv[2]).parent.mkdir(parents=True, exist_ok=True)
 shutil.copytree(src, sys.argv[2])
-print("starting weights downloaded from", sys.argv[1])
+print("downloaded", sys.argv[1])
 PYEOF
-  fi
+}
+init_weights() {   # starting weights for training (downloaded on a fresh machine)
+  if [ ! -d "$TRAIN_INIT" ] && [ -n "${TRAIN_INIT_HF:-}" ]; then fetch_hf "$TRAIN_INIT_HF" "$TRAIN_INIT"; fi
   [ -d "$TRAIN_INIT" ] || { echo "starting weights $TRAIN_INIT not found"; return 1; }
+}
+s_ablate() {   # short runs comparing training recipes; the best one is used by s_train
+  if [ "${ABLATE:-0}" != 1 ]; then echo "no recipe comparison requested (ABLATE=${ABLATE:-0})"; return 0; fi
+  local qat=""; [ -f "$STATE/fp8_ok" ] && qat="--qat"
+  init_weights
+  "$PY" -m emcdraft.ablate --target "$TARGET" --init "$TRAIN_INIT" --data "$DATA/train" --dev "$DATA/dev" \
+    --out "$RUNS/ablate" --results "$RESULTS" --state "$STATE" --steps "${ABLATE_STEPS:-300}" $qat
+}
+s_train() {
+  local qat=""; [ -f "$STATE/fp8_ok" ] && qat="--qat"
+  local extra=""; [ -f "$STATE/train_args" ] && extra=$(cat "$STATE/train_args")
+  echo "training recipe: ${extra:-defaults}"
+  init_weights
   rm -rf "$OUTRUN"
-  "$PY" -m emcdraft.train --target "$TARGET" --init "$TRAIN_INIT" --data "$DATA/train" --dev "$DATA/dev" --out "$OUTRUN" $qat
+  "$PY" -m emcdraft.train --target "$TARGET" --init "$TRAIN_INIT" --data "$DATA/train" --dev "$DATA/dev" --out "$OUTRUN" $qat $extra
+  cat "$STATE/run_id" > "$OUTRUN/run_id"      # which run the exported folders belong to (for uploads)
   for s in "$OUTRUN"/sub_*; do SUB="$s" kit validate; done
 }
 primary() { if [ -d "$OUTRUN/sub_fp8" ]; then echo "$OUTRUN/sub_fp8"; else echo "$OUTRUN/sub_bf16"; fi; }
@@ -158,6 +175,21 @@ s_eval_alt() {
   SUB="$OUTRUN/sub_bf16" TAG="${EVAL_PREFIX}_bf16" kit eval
 }
 s_report() { "$PY" "$REPO/scripts/collect.py"; }
+new_tag() { echo "${EVAL_PREFIX}_$(basename "$(primary)" | sed 's/^sub_//')"; }
+s_eval_prev() {   # the previous best draft on this machine, when its result is not here yet
+  if [ -z "$PREV_TAG" ]; then echo "no previous draft to compare with"; return 0; fi
+  if [ -f "$RESULTS/$PREV_TAG.json" ]; then echo "previous draft already evaluated on this machine"; return 0; fi
+  if [ ! -d "$PREV_SUB" ] && [ -n "${PREV_SUB_HF:-}" ]; then fetch_hf "$PREV_SUB_HF" "$PREV_SUB"; fi
+  SUB="$PREV_SUB" TAG="$PREV_TAG" kit eval
+}
+s_choose() {
+  "$PY" "$REPO/scripts/choose.py" --new "$(new_tag)" --new-sub "$(primary)" --prev "$PREV_TAG"     --prev-sub "$PREV_SUB" --results "$RESULTS" --state "$STATE"
+}
+bench() { env EMC_TARGET="$TARGET" EMC_SUB="${SUB:-}" EMC2_WORK="$WORK" "$PY" "$REPO/scripts/bench.py" "$@"; }
+final_sub() { if [ -f "$STATE/final_sub" ]; then cat "$STATE/final_sub"; else primary; fi; }
+s_bench_draft() { SUB="$(final_sub)" bench --tag draft --what batch,long,k; }
+s_bench_baseline() { SUB="$BASELINE" bench --tag baseline --what batch,long; }
+s_bench_target() { SUB="" bench --tag target_only --target-only --what batch,long; }
 
 log "pipeline start: run $(cat "$STATE/run_id"), code $(cat "$REPO/.commit" 2>/dev/null | cut -c1-12), training run $RUN_NAME"
 # a vLLM server left behind by an interrupted run would still hold the GPU
@@ -175,6 +207,7 @@ if [ -n "$prompts_pid" ]; then wait "$prompts_pid"; fi
 is_done prompts || { log "stopping: prompts failed"; exit 1; }
 stage generate 1 s_generate
 stage extract 1 s_extract
+stage ablate 0 s_ablate || true
 stage train 1 s_train
 sync_hf --submissions
 stage eval_main 0 s_eval_main || true
@@ -182,6 +215,14 @@ stage report_main 0 s_report || true
 stage eval_baseline 0 s_eval_baseline || true
 stage report_baseline 0 s_report || true
 stage eval_alt 0 s_eval_alt || true
+stage eval_prev 0 s_eval_prev || true
+stage choose 0 s_choose || true
 stage report 0 s_report || true
+if [ "${BENCH:-0}" = 1 ]; then
+  stage bench_draft 0 s_bench_draft || true
+  stage bench_baseline 0 s_bench_baseline || true
+  stage bench_target 0 s_bench_target || true
+  stage report_bench 0 s_report || true
+fi
 sync_hf --submissions
 log "pipeline finished"
