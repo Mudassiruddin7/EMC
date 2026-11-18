@@ -2,8 +2,8 @@
 
 Objective: for every position of a greedy answer, run the same K-step recursive drafting
 the engine runs (step k re-uses the head's own hidden state from step k-1) and train every
-step to produce the token the target actually emitted. Step 1 additionally distils the
-target's full next-token distribution. Later steps are weighted by whether the earlier
+step to produce the token the target actually emitted, plus (weight beta) the target's full
+next-token distribution at that position. Later steps are weighted by whether the earlier
 steps were right, because the engine only ever reaches them in that case.
 
 With --qat the large matrices are trained through FP8 (E4M3) rounding (straight-through),
@@ -72,7 +72,8 @@ def train_step(head, embed, W, batch, a, K=3):
             labels = tokens[:, (base[0] + 1 + k).clamp(max=Tm - 1)]
             w = valid.float() if prev is None else valid.float() * (a.floor + (1 - a.floor) * prev.float())
             bi, ni = valid.nonzero(as_tuple=True)
-            teach = hidden[bi, (ni + 1).clamp(max=N - 1)] if (k == 1 and a.beta > 0) else None
+            # the target's own distribution for the same token: h_{i+k} predicts x_{i+k+1}
+            teach = hidden[bi, (ni + k).clamp(max=N - 1)] if a.beta > 0 else None
             s_k, ce_k, corr = head_loss(out[bi, ni], W, labels[bi, ni], w[bi, ni], teach, a.beta)
             total = total + a.step_w[k - 1] * s_k
             full = torch.zeros(B, N, dtype=torch.bool, device=tokens.device)

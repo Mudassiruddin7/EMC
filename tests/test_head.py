@@ -9,7 +9,8 @@ Checks the pieces whose correctness the whole pipeline rests on:
   3. `equalize_` leaves the head's function unchanged;
   4. `walk` reproduces a hand-checked acceptance count;
   5. a few training steps run, reduce the loss, and the exported folders pass the kit's
-     static validation (when a kit checkout is given via EMC2_HOME).
+     static validation (when a kit checkout is given via EMC2_HOME);
+  6. prompt helpers, batching and the supervisor's branch lookup (needs network) behave.
 """
 import json
 import os
@@ -163,6 +164,39 @@ def test_train_and_export(head, E, W):
         print("  export: FP8 and bf16 folders round-trip" + (" and pass the kit's validate" if os.environ.get("EMC2_HOME") else ""))
 
 
+def test_helpers():
+    from emcdraft.extract import make_batches
+    from emcdraft.prompts import CODE_T, clean_story_prompt, drop_dev_overlap, make_stub
+    x = torch.randn(3, 1000) * 0.3
+    assert torch.equal(e4m3_encode(x, chunk=777), e4m3_encode(x)), "chunked FP8 encoding differs"
+    stub = make_stub("Write a function to add two numbers.", "def add(a, b):\n    return a + b\n")
+    assert stub.startswith("def add(a, b):") and '"""Write a function' in stub, stub
+    assert make_stub("too short", "def f(): pass") is None
+    assert clean_story_prompt("[ WP ] You 've won the lottery , but there 's a catch .") == \
+        "You've won the lottery, but there's a catch."
+    assert clean_story_prompt("[ EU ] fan fiction") is None
+    dev = ["Complete the following Python function.\n\n```python\ndef strlen(string: str) -> int:\n```",
+           "Ruby is 6 times older than Sam. In 9 years, Ruby will be 3 times as old as Sam. How old is Sam now?"]
+    train = [CODE_T.format(stub="def strlen(s):\n    pass\n"), CODE_T.format(stub="def other(s):\n    pass\n"),
+             "Ruby is 6 times older than Sam. In 9 years, Ruby will be 3 times as old as Sam. How old is Sam now?"
+             "\n\nSolve this step by step, then give the final answer on its own line as 'Answer: <number>'."]
+    kept = drop_dev_overlap(train, dev)
+    assert kept == [train[1]], kept
+    seqs = [{"ids": [0] * n} for n in (5, 50, 7, 49, 20, 3)]
+    b = make_batches(seqs, 100)
+    assert sorted(i for x in b for i in x) == list(range(6))
+    assert all(len(x) * max(len(seqs[i]["ids"]) for i in x) <= 100 for x in b), b
+    print("  prompts / batching helpers ok")
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import supervise
+        sha = supervise.remote_sha()
+        assert sha and len(sha) == 40
+        print(f"  supervisor sees branch head {sha[:12]}")
+    except OSError as e:
+        print("  supervisor branch lookup skipped (no network):", e)
+
+
 if __name__ == "__main__":
     head = MTPHead(C)
     for p in head.parameters():
@@ -174,4 +208,5 @@ if __name__ == "__main__":
         print("equalize"); test_equalize(head, E)
     print("walk"); test_walk()
     print("train/export"); test_train_and_export(head, E, W)
+    print("helpers"); test_helpers()
     print("ALL OK")

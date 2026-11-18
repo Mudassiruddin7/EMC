@@ -45,12 +45,17 @@ before choosing it:
 
 ### Training
 
-* **Data — the target's own greedy answers.** The target (Hugging Face implementation) answers
-  fresh prompts in the four evaluated domains (chat, code, math, long-form writing), phrased
-  like the public dev tasks; every token's final hidden state is stored. Prompts come from
-  public instruction sets (GSM8K / MetaMathQA, WritingPrompts, UltraChat / Alpaca / Dolly,
-  Python instruction sets). Anything overlapping the dev prompts is removed; the dev set is
-  never trained on.
+* **Data — the target's own greedy answers.** Fresh prompts in the four evaluated domains
+  (chat, code, math, long-form writing), phrased like the public dev tasks, are answered
+  greedily by the target running in the serving engine itself (vLLM 0.31.0), so the training
+  text is exactly the kind of text the draft has to predict. The target's final hidden state
+  at every position is then recomputed with the reference implementation in one
+  teacher-forced pass. Two checks guard this step: the reference implementation must agree
+  with the engine's greedy choices along the dev references, and the offline simulator
+  (below) must reproduce the kit-measured acceptance of the baseline head. Prompts come from
+  public instruction sets (GSM8K / Orca-Math, WritingPrompts, UltraChat / Alpaca / Dolly,
+  Python instruction sets, MBPP); anything overlapping the dev prompts is removed and the
+  dev set is never trained on.
 * **Objective — the engine's drafting loop.** `emcdraft.head.unroll` runs all three draft steps
   for every position of a sequence in parallel, with exactly the key/value visibility the
   engine's draft cache has (verified prefix, then the round's own entries). Each step is
@@ -77,36 +82,54 @@ dataset repo. *(Filled in by the run — see `results/summary.md`.)*
 
 ```
 emcdraft/head.py      MTP head re-implementation, K-step unroll, FP8 rounding/encoding, export
-emcdraft/target.py    target wrapper: final hidden states and batched greedy generation
-emcdraft/prompts.py   training prompts per domain, dev-overlap filter
-emcdraft/datagen.py   sanity checks against the dev set, hold-out features, data generation
+emcdraft/prompts.py   training prompts per domain, dev-overlap filter, template check
+emcdraft/gen_vllm.py  greedy answers of the target with the serving engine
+emcdraft/target.py    reference implementation wrapper: final hidden states (teacher forcing)
+emcdraft/extract.py   hidden-state shards, agreement check, simulator check on the baseline
 emcdraft/sim.py       offline acceptance simulator, feature shards
 emcdraft/train.py     fine-tuning (recursive objective, optional FP8 QAT), export
 emcdraft/probe.py     untrained FP8 copy of the baseline (engine loading probe)
 scripts/kit.py        runs the official kit commands without a container runtime
-scripts/pipeline.sh   end-to-end, resumable pipeline;  scripts/bootstrap.sh starts it detached
+scripts/pipeline.sh   end-to-end, resumable pipeline (one stage per step, logs per stage)
+scripts/supervise.py  unattended driver: code updates, control requests, log uploads
+scripts/launch.py     starts the driver on a GPU machine (or prints its status)
 scripts/sync.py       pushes logs / results / draft folders to the Hugging Face dataset repo
 scripts/collect.py    results/summary.{json,md}
+control/              stage re-run requests and budget settings read by the driver
 tests/test_head.py    CPU self-test (FP8 codec, unroll vs. step-by-step emulation, export)
 ```
 
 ## Reproduce
 
-Linux, one GPU with ≥ 80 GB, ~110 GB of disk.
+Linux, one GPU with at least 80 GB, about 110 GB of disk. In a Python shell or notebook on
+that machine:
 
-```bash
-git clone https://github.com/Mudassiruddin7/EMC.git ~/emc/repo
-bash ~/emc/repo/scripts/bootstrap.sh          # runs detached; progress in ~/emc/logs/pipeline.log
+```python
+import os, urllib.request
+os.environ["HF_TOKEN"] = "<token with write access to the results repo>"
+exec(urllib.request.urlopen(
+    "https://raw.githubusercontent.com/Mudassiruddin7/EMC/main/scripts/launch.py").read(),
+    {"__name__": "__main__"})
 ```
 
-The pipeline installs `vllm==0.31.0` into a private environment, downloads the target at the
-kit's pinned revision, builds and validates the baseline, checks that the engine loads an
-FP8-typed head, generates data, trains, and evaluates with the **official kit**
-(`validate`, `eval`) — through `scripts/kit.py`, which only redirects the kit's container
-paths. The engine is the pinned version installed from PyPI rather than the container image;
-the results JSON records this.
+This starts `scripts/supervise.py`, which runs `scripts/pipeline.sh` stage by stage:
 
-`python tests/test_head.py` runs the CPU self-test (no GPU, no downloads).
+| stage | what it does |
+|---|---|
+| env | private Python 3.12 environment with `vllm==0.31.0` |
+| download | the kit (pinned commit) and the target at the kit's pinned revision |
+| baseline | `emc2 prepare-baseline` + `validate` |
+| probe, smoke_fp8 | FP8 copy of the untrained baseline head through the official `eval` (2 prompts per domain) |
+| prompts | training prompts (runs in parallel with the GPU checks) |
+| generate | greedy answers with the engine (token budget `GEN_TOKENS`) |
+| extract | hidden states + agreement and simulator checks |
+| train | fine-tuning, export of `sub_fp8` / `sub_bf16`, `validate` |
+| eval_main, eval_baseline, eval_alt | full official `eval` (160 dev prompts) of the draft, the baseline and the second variant |
+
+Every stage resumes after an interruption, and logs, kit results, generated data and the
+draft folders are pushed to the dataset repo as they are produced. The engine is the
+pinned version installed from PyPI rather than the container image; the results JSON records
+this. `python tests/test_head.py` runs the CPU self-test (no GPU, no downloads).
 
 ## Submission format and rules
 

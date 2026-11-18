@@ -75,8 +75,18 @@ def e4m3_round(w: torch.Tensor) -> torch.Tensor:
     return (torch.sign(w.detach().float()) * q).to(w.dtype)
 
 
-def e4m3_encode(w: torch.Tensor) -> torch.Tensor:
-    """uint8 bit patterns (sign | 4-bit exponent, bias 7 | 3-bit mantissa) of on-grid values."""
+def e4m3_encode(w: torch.Tensor, chunk: int = 1 << 24) -> torch.Tensor:
+    """uint8 bit patterns (sign | 4-bit exponent, bias 7 | 3-bit mantissa) of on-grid values.
+
+    Works in chunks so the int64 temporaries stay small (host memory is limited)."""
+    flat = w.detach().reshape(-1)
+    out = torch.empty(flat.numel(), dtype=torch.uint8, device=flat.device)
+    for s in range(0, flat.numel(), chunk):
+        out[s:s + chunk] = _e4m3_encode(flat[s:s + chunk])
+    return out.view(w.shape)
+
+
+def _e4m3_encode(w: torch.Tensor) -> torch.Tensor:
     q = e4m3_round(w.float())
     a = q.abs()
     _, ex = torch.frexp(a)

@@ -1,6 +1,6 @@
 # engine (pinned by the competition kit)
 vllm==0.31.0
-# offline data generation / training
+# data generation / training (installed next to the engine)
 accelerate
 datasets
 safetensors
