@@ -75,29 +75,32 @@ before choosing it:
 
 ## Results
 
-Official kit `eval` (vLLM 0.31.0, all 160 dev prompts, K = 3), every row measured in the same
-run on the same **NVIDIA RTX PRO 6000 Blackwell**:
+Official kit `eval` (vLLM 0.31.0, all 160 dev prompts, K = 3), run **r2**, every row measured
+in the same run on the same **NVIDIA RTX PRO 6000 Blackwell**:
 
 | draft | τ | chat / code / math / long-form | TPOT | memory | score, same GPU | score, published baseline |
 |---|---|---|---|---|---|---|
-| baseline (the target's built-in MTP head) | 2.806 | 3.06 / 3.74 / 3.64 / 2.37 | 15.39 ms | 0.917 GB | 100.0 | 96.2 |
-| this draft, bf16 | 2.885 | 3.07 / 3.75 / 3.70 / 2.48 | 15.31 ms | 0.917 GB | 102.3 | 98.5 |
-| **this draft, FP8 (submitted variant)** | **2.868** | 3.08 / 3.78 / 3.68 / 2.45 | 15.27 ms | **0.607 GB** | **114.4** | **110.7** |
+| baseline (the target's built-in MTP head) | 2.805 | 3.07 / 3.77 / 3.63 / 2.36 | 15.39 ms | 0.917 GB | 100.0 | 96.2 |
+| **this draft, FP8 (submitted variant)** | **2.900** | 3.08 / 3.77 / 3.70 / 2.50 | 15.24 ms | **0.607 GB** | **115.4** | **111.6** |
 
 * *Score, same GPU* uses the baseline as measured above; *score, published baseline* is the
   kit's own number, whose speed term compares against the organisers' TPOT from different
   hardware (that is why the baseline itself gets 96.2 there).
-* The FP8 variant's same-GPU score splits into acceptance 1.034 (×0.5), memory 1.5 (×0.25,
-  the cap) and speed 1.008 (×0.25). Most of the gain is the compact storage; fine-tuning added
-  +0.06 to τ, mostly in long-form writing (+0.08) and math (+0.04).
-* The offline simulator predicted the dev acceptance within 0.015 of the engine (2.858 vs
-  2.868 for the FP8 draft, 2.792 vs 2.806 for the baseline).
-* Run r1 trained on 2.02 M generated tokens (4,820 answers) for 584 steps (13 min); its
-  validation τ was still rising when the schedule ended. Total GPU time for the whole pipeline,
-  including the three full evaluations: about 2.6 hours.
+* The same-GPU score splits into acceptance 1.053 (×0.5), memory 1.5 (×0.25, the cap) and
+  speed 1.010 (×0.25). Fine-tuning added +0.095 to τ, mostly in long-form writing (+0.14) and
+  math (+0.07); chat and code were already close to what one head layer can reach.
+* The offline simulator predicted the dev acceptance within 0.02 of the engine (2.884 vs
+  2.900 for the draft, 2.793 vs 2.805 for the baseline).
+* r2 trained on 4.06 M generated tokens (9,634 answers) for 1,190 steps (2 epochs, 27 min);
+  validation τ was still rising at the last step. The whole pipeline, including two full
+  evaluations, took about 3 hours of GPU time.
 
-Raw kit outputs, per-stage logs, machine statistics and the training summary are in the
-dataset repo under `runs/r1/`; the exported draft folders under `submissions/r1/`.
+Earlier run **r1** (2.02 M tokens, 584 steps) reached τ 2.868 and a same-GPU score of 114.4
+(bf16 variant: τ 2.885, score 102.3). Twice the data gave +0.03 τ.
+
+Raw kit outputs, per-stage logs, machine statistics and training summaries are in the
+dataset repo under `runs/r1/` and `runs/r2/`; the r2 draft folders (FP8 and bf16, each with
+`model.safetensors`) under `submissions/r2/`.
 
 ## Layout
 
