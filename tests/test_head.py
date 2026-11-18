@@ -253,7 +253,7 @@ def test_recipes(head, E, W):
     from emcdraft.head import save_safetensors_raw
     from emcdraft.sim import save_shard
     root = Path(__file__).resolve().parents[1]
-    env = dict(os.environ, PYTHONPATH=str(root), TRAIN_DATA_DEVICE="cpu")
+    env = dict(os.environ, PYTHONPATH=str(root), TRAIN_DATA_DEVICE="cpu", TRAIN_LOWRANK_RANKS="4,8")
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         tgt, init, data = tmp / "target", tmp / "init", tmp / "data"
@@ -286,11 +286,19 @@ def test_recipes(head, E, W):
         assert "acceptance-aware" in meta["method_description"] and "top-5" in meta["method_description"]
         assert len(s["history"]) == 2 and (tmp / "full" / "sub_bf16" / "model.safetensors").exists()
         assert "w [" in r.stdout, "auto step weights not reported"
+        assert [x["rank"] for x in s["lowrank"]] == [4, 8] and all(x["val_tau"] >= 1 for x in s["lowrank"])
+        r = run(["emcdraft.train", *common, "--out", str(tmp / "lora"), "--qat", "--lora", "4", "--max-steps", "3",
+                 "--eval-every", "3", "--batch-tokens", "200", "--lowrank-ranks", ""])
+        assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
+        merged = load_mtp_state(tmp / "lora" / "sub_bf16")
+        assert set(merged) == set(head.state_dict()), "LoRA must merge into the dense layout"
+        changed = [n for n in FP8_TENSORS if not torch.equal(merged[n], load_mtp_state(init)[n])]
+        assert "LoRA rank 4" in r.stdout and changed, "LoRA training did not change the matrices"
         r = run(["emcdraft.ablate", *common, "--out", str(tmp / "abl"), "--results", str(tmp / "res"),
                  "--state", str(tmp), "--qat", "--steps", "2"])
         assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
         ab = json.loads((tmp / "res" / "ablation.json").read_text())
-        assert set(ab["recipes"]) == {"control", "accw_topk", "accw_topk_mask", "accw_topk_lr2"}
+        assert set(ab["recipes"]) == {"control", "accw_topk", "accw_topk_mask", "accw_topk_lr2", "accw_topk_lora"}
         assert (tmp / "train_args").read_text().split() == ab["recipes"][ab["chosen"]]["flags"]
         assert not any((tmp / "abl" / n / "sub_fp8").exists() for n in ab["recipes"]), "ablation runs must not export"
         # keep-the-better-draft rule

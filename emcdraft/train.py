@@ -23,7 +23,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from .head import (FP8_TENSORS, HeadConfig, build_head, e4m3_round, equalize_, export_submission,
+from .head import (FP8_TENSORS, HeadConfig, QLinear, build_head, e4m3_round, equalize_, export_submission,
                    load_mtp_state, load_target_tensors, unroll)
 from .sim import DOMAINS, batches, collate, load_shards, shards_bytes, simulate
 
@@ -95,6 +95,34 @@ def train_step(head, embed, W, batch, a, K=3):
     return total, info
 
 
+@torch.no_grad()
+def lowrank_analysis(head, embed, W, val, dev_seqs, ranks):
+    """Acceptance when every matrix of the head is replaced by its best rank-r approximation
+    (truncated SVD): how much a low-rank head would lose. The engine runs dense layers only,
+    so this is an analysis; the exported files are unaffected."""
+    lin = {n: m for n, m in head.named_modules() if isinstance(m, QLinear)}
+    keep = {n: m.weight.detach().clone() for n, m in lin.items()}
+    svd = {n: torch.linalg.svd(w.float(), full_matrices=False) for n, w in keep.items()}
+    dense = sum(w.numel() for w in keep.values())
+    rows = []
+    for r in sorted(ranks):
+        for n, m in lin.items():
+            U, S, Vh = svd[n]
+            k = min(r, S.numel())
+            m.weight.copy_(((U[:, :k] * S[:k]) @ Vh[:k]).to(m.weight.dtype))
+        factored = sum(min(r, min(w.shape)) * sum(w.shape) for w in keep.values())
+        row = {"rank": r, "matrix_params_factored": factored, "matrix_params_dense": dense,
+               "val_tau": simulate(head, embed, W, val)["acceptance_length"]}
+        if dev_seqs:
+            row["dev_tau"] = simulate(head, embed, W, dev_seqs)["acceptance_length"]
+        rows.append(row)
+        log(f"low-rank r={r}: matrix parameters {factored / 1e6:.0f} M of {dense / 1e6:.0f} M, val tau "
+            f"{row['val_tau']:.4f}" + (f", dev tau {row['dev_tau']:.4f}" if dev_seqs else ""))
+    for n, m in lin.items():
+        m.weight.copy_(keep[n])
+    return rows
+
+
 def split_val(seqs, frac, rng):
     by = {}
     for s in seqs:
@@ -132,6 +160,10 @@ def main():
     ap.add_argument("--step-w", nargs="+", default=os.environ.get("TRAIN_STEP_W", "1 0.7 0.5").split(),
                     help="three step weights, or 'auto': each step weighted by the derivative of the "
                          "acceptance length with respect to its accuracy")
+    ap.add_argument("--lora", type=int, default=int(os.environ.get("TRAIN_LORA", 0)),
+                    help="train rank-r adapters on every matrix instead of the matrices themselves (0: off)")
+    ap.add_argument("--lowrank-ranks", default=os.environ.get("TRAIN_LOWRANK_RANKS", "256,512,1024,2048"),
+                    help="after training: acceptance with every matrix cut to these ranks (SVD), for analysis")
     ap.add_argument("--max-steps", type=int, default=0, help="cap on optimizer steps (short ablation runs)")
     ap.add_argument("--no-export", action="store_true", help="ablation run: no submission folders")
     ap.add_argument("--quick", action="store_true", help="ablation run: simulate the validation set only")
@@ -203,10 +235,27 @@ def main():
         head.set_fake_quant(True)
         sims("fp8_untrained")
 
+    mods = dict(head.named_modules())
+    if a.lora:
+        for m in mods.values():
+            if isinstance(m, QLinear):
+                m.add_lora(a.lora)
+        log(f"LoRA rank {a.lora}: {sum(p.numel() for p in head.parameters() if p.requires_grad) / 1e6:.1f} M "
+            f"trainable parameters")
+    rms = lambda t: float(t.detach().float().pow(2).mean().sqrt())
     groups = []
     for n, p in head.named_parameters():
-        eff = (1 + p.detach()) if p.ndim == 1 else p.detach()
-        groups.append({"params": [p], "base": a.rel_lr * float(eff.float().pow(2).mean().sqrt()), "lr": 0.0})
+        if not p.requires_grad:
+            continue
+        if n.endswith("lora_b"):
+            # an Adam step of size lr on B moves B @ A by about lr * sqrt(r / in) per entry;
+            # match the relative step of full fine-tuning on the frozen matrix
+            m = mods[n.rsplit(".", 1)[0]]
+            base = a.rel_lr * rms(m.weight) * math.sqrt(m.weight.shape[1] / a.lora)
+        else:
+            eff = (1 + p.detach()) if p.ndim == 1 else p.detach()
+            base = a.rel_lr * rms(eff)
+        groups.append({"params": [p], "base": base, "lr": 0.0})
     opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0)
 
     per_epoch = len(batches(train, a.batch_tokens))
@@ -270,6 +319,9 @@ def main():
                 done = True
                 break
     head.load_state_dict(best["state"])
+    for m in head.modules():
+        if isinstance(m, QLinear):
+            m.merge_lora()
     head.eval()
     summary["history"] = hist
     summary["best_step"] = best["step"]
@@ -287,6 +339,7 @@ def main():
                                    "built-in head and fine-tuned with a 3-step recursive drafting objective"
                                    + (", acceptance-aware step weights" if auto_w else "")
                                    + (f", top-{a.topk} distillation" if a.topk else "")
+                                   + (f", rank-{a.lora} LoRA adapters merged into the weights" if a.lora else "")
                                    + (" and FP8 (E4M3) quantisation-aware training" if a.qat else "")),
             "training_data": ("Greedy answers of the target itself (with its hidden states) to public "
                               "instruction prompts: GSM8K/Orca-Math, WritingPrompts, UltraChat/Alpaca/Dolly, "
@@ -302,6 +355,9 @@ def main():
         head.set_fake_quant(False)
     sims("final_bf16")
     summary["export_bf16"] = export_submission(head, out / "sub_bf16", tcfg, False, meta)
+    if a.lowrank_ranks:
+        summary["lowrank"] = lowrank_analysis(head, embed, W, val, dev_seqs,
+                                              [int(x) for x in a.lowrank_ranks.split(",") if x.strip()])
     summary["total_seconds"] = round(time.time() - t_start, 1)
     (out / "train_summary.json").write_text(json.dumps(summary, indent=2, default=str))
     log("training finished")

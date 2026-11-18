@@ -15,6 +15,8 @@ Recipes (each adds one published idea to the one before it):
   accw_topk_mask  + later steps trained almost only where the engine reaches them
                   (token-alignable training, GRIFFIN): floor 0.3 -> 0.1
   accw_topk_lr2   accw_topk with twice the learning rate
+  accw_topk_lora  accw_topk, but only rank-128 updates of every matrix are learned (LoRA, Hu et
+                  al. 2021) and merged before export - a low-rank constraint on what changes
 
     python -m emcdraft.ablate --target DIR --init DIR --data DIR --out runs/ablate --results results --state state
 """
@@ -35,6 +37,8 @@ RECIPES = [
      ["--step-w", "auto", "--topk", "10", "--floor", "0.1", "--rel-lr", "1e-3"]),
     ("accw_topk_lr2", "accw_topk + twice the learning rate",
      ["--step-w", "auto", "--topk", "10", "--floor", "0.3", "--rel-lr", "2e-3"]),
+    ("accw_topk_lora", "accw_topk with rank-128 LoRA adapters instead of full fine-tuning",
+     ["--step-w", "auto", "--topk", "10", "--floor", "0.3", "--rel-lr", "1e-3", "--lora", "128"]),
 ]
 
 

@@ -20,6 +20,7 @@ checkpoint names without the ``mtp.`` prefix) and adds what training needs:
 from __future__ import annotations
 
 import json
+import math
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,14 +109,37 @@ def e4m3_decode(b: torch.Tensor) -> torch.Tensor:
 
 
 class QLinear(nn.Linear):
-    """Bias-free linear layer; ``fq=True`` fake-quantises the weight to E4M3 (STE)."""
+    """Bias-free linear layer; ``fq=True`` fake-quantises the weight to E4M3 (STE).
+
+    ``add_lora(r)`` freezes the weight and learns a rank-r update B @ A instead (LoRA, Hu et
+    al. 2021); ``merge_lora()`` folds it back into the weight, so exported files keep the
+    engine's dense layout."""
 
     def __init__(self, i: int, o: int):
         super().__init__(i, o, bias=False)
         self.fq = False
+        self.lora_a = self.lora_b = None
+
+    def add_lora(self, r: int):
+        o, i = self.weight.shape
+        dev = self.weight.device
+        self.weight.requires_grad_(False)
+        self.lora_a = nn.Parameter(torch.randn(r, i, device=dev) / math.sqrt(i))
+        self.lora_b = nn.Parameter(torch.zeros(o, r, device=dev))
+
+    @torch.no_grad()
+    def merge_lora(self):
+        if self.lora_a is not None:
+            self.weight.copy_(self.dense_weight())
+            self.lora_a = self.lora_b = None
+            self.weight.requires_grad_(True)
+
+    def dense_weight(self) -> torch.Tensor:
+        w = self.weight
+        return w if self.lora_a is None else w + (self.lora_b @ self.lora_a).to(w.dtype)
 
     def qweight(self) -> torch.Tensor:
-        w = self.weight
+        w = self.dense_weight()
         return w + (e4m3_round(w) - w).detach() if self.fq else w
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
