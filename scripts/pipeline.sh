@@ -25,6 +25,11 @@ export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/inductor" TRITON_CACHE_DIR="$WORK/ca
 # greedy decoding only: use the built-in sampler instead of compiling FlashInfer kernels at start-up
 export VLLM_USE_FLASHINFER_SAMPLER=0
 [ -f "$STATE/run_id" ] || echo "${RUN_ID:-$(date +%Y%m%d-%H%M)}" > "$STATE/run_id"
+# training run name (runs/<name>), its starting weights and whether to also evaluate the bf16 variant
+RUN_NAME="${RUN_NAME:-main}"; TRAIN_INIT="${TRAIN_INIT:-$BASELINE}"; EVAL_ALT="${EVAL_ALT:-1}"
+case "$TRAIN_INIT" in /*) ;; *) TRAIN_INIT="$EMC_ROOT/$TRAIN_INIT" ;; esac
+OUTRUN="$RUNS/$RUN_NAME"
+if [ "$RUN_NAME" = main ]; then EVAL_PREFIX=eval_draft; else EVAL_PREFIX="eval_$RUN_NAME"; fi
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGS/pipeline.log"; }
 sync_hf() { if [ -x "$PY" ]; then "$PY" "$REPO/scripts/sync.py" "$@" >> "$LOGS/sync.log" 2>&1 || true; fi; }
@@ -122,20 +127,34 @@ s_generate() { "$PY" -m emcdraft.gen_vllm --target "$TARGET" --prompts "$DATA/pr
 s_extract()  { "$PY" -m emcdraft.extract --target "$TARGET" --kit "$KIT" --baseline "$BASELINE" --gen "$DATA/gen" --out "$DATA" --results "$RESULTS"; }
 s_train() {
   local qat=""; [ -f "$STATE/fp8_ok" ] && qat="--qat"
-  rm -rf "$RUNS/main"
-  "$PY" -m emcdraft.train --target "$TARGET" --init "$BASELINE" --data "$DATA/train" --dev "$DATA/dev" --out "$RUNS/main" $qat
-  for s in "$RUNS"/main/sub_*; do SUB="$s" kit validate; done
+  if [ ! -d "$TRAIN_INIT" ] && [ -n "${TRAIN_INIT_HF:-}" ]; then   # e.g. on a fresh machine
+    "$PY" - "$TRAIN_INIT_HF" "$TRAIN_INIT" <<'PYEOF'
+import shutil, sys
+from pathlib import Path
+from huggingface_hub import snapshot_download
+repo, sub = sys.argv[1].split(":", 1)
+src = Path(snapshot_download(repo, repo_type="dataset", allow_patterns=[sub + "/*"])) / sub
+Path(sys.argv[2]).parent.mkdir(parents=True, exist_ok=True)
+shutil.copytree(src, sys.argv[2])
+print("starting weights downloaded from", sys.argv[1])
+PYEOF
+  fi
+  [ -d "$TRAIN_INIT" ] || { echo "starting weights $TRAIN_INIT not found"; return 1; }
+  rm -rf "$OUTRUN"
+  "$PY" -m emcdraft.train --target "$TARGET" --init "$TRAIN_INIT" --data "$DATA/train" --dev "$DATA/dev" --out "$OUTRUN" $qat
+  for s in "$OUTRUN"/sub_*; do SUB="$s" kit validate; done
 }
-primary() { if [ -d "$RUNS/main/sub_fp8" ]; then echo "$RUNS/main/sub_fp8"; else echo "$RUNS/main/sub_bf16"; fi; }
-s_eval_main() { local p; p=$(primary); SUB="$p" TAG="eval_draft_$(basename "$p" | sed 's/^sub_//')" kit eval; }
+primary() { if [ -d "$OUTRUN/sub_fp8" ]; then echo "$OUTRUN/sub_fp8"; else echo "$OUTRUN/sub_bf16"; fi; }
+s_eval_main() { local p; p=$(primary); SUB="$p" TAG="${EVAL_PREFIX}_$(basename "$p" | sed 's/^sub_//')" kit eval; }
 s_eval_baseline() { SUB="$BASELINE" TAG=eval_baseline kit eval; }
 s_eval_alt() {
-  if [ ! -d "$RUNS/main/sub_fp8" ]; then echo "only one variant"; return 0; fi
-  SUB="$RUNS/main/sub_bf16" TAG=eval_draft_bf16 kit eval
+  if [ "$EVAL_ALT" != 1 ]; then echo "bf16 variant not evaluated (EVAL_ALT=$EVAL_ALT)"; return 0; fi
+  if [ ! -d "$OUTRUN/sub_fp8" ]; then echo "only one variant"; return 0; fi
+  SUB="$OUTRUN/sub_bf16" TAG="${EVAL_PREFIX}_bf16" kit eval
 }
 s_report() { "$PY" "$REPO/scripts/collect.py"; }
 
-log "pipeline start: run $(cat "$STATE/run_id"), code $(cat "$REPO/.commit" 2>/dev/null | cut -c1-12)"
+log "pipeline start: run $(cat "$STATE/run_id"), code $(cat "$REPO/.commit" 2>/dev/null | cut -c1-12), training run $RUN_NAME"
 # a vLLM server left behind by an interrupted run would still hold the GPU
 if pkill -f -- "--served-model-name target" 2>/dev/null; then log "stopped a leftover vLLM server"; sleep 20; fi
 stage env 1 s_env

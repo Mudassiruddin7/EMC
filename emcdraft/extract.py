@@ -76,6 +76,35 @@ def featurize(tgt, seqs, max_tokens, agree):
     return feats
 
 
+def shard_part(name: str) -> int:
+    """Training shards of the first extraction are g0000...; later appended parts p<k>g0000..."""
+    return int(name[1:name.index("g")]) if name.startswith("p") else 1
+
+
+def plan_train(out: Path, gen: Path, append: bool):
+    """Which generated files to featurize and how to name the new shards.
+
+    Returns (files, shard prefix, consumed file names, number of kept shards). Without append
+    every earlier shard is deleted. With append the shards are kept and only files not listed in
+    <out>/consumed_gen.json are featurized (a first extraction without that list consumed the
+    plain <domain>.jsonl files)."""
+    train = out / "train"
+    train.mkdir(parents=True, exist_ok=True)
+    kept = sorted(train.glob("*.json"))
+    if not append or not kept:
+        for p in train.glob("*"):
+            p.unlink()
+        kept, consumed, prefix = [], set(), "g"
+    else:
+        listed = out / "consumed_gen.json"
+        consumed = (set(json.loads(listed.read_text())) if listed.exists()
+                    else {f"{d}.jsonl" for d in DOMAINS})
+        prefix = f"p{max(shard_part(p.stem) for p in kept) + 1}g"
+    files = [p for p in sorted(Path(gen).glob("*.jsonl"))
+             if p.name not in consumed and p.name.split(".")[0].split("-")[0] in DOMAINS]
+    return files, prefix, consumed, len(kept)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True)
@@ -90,12 +119,14 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     out, res = Path(a.out), Path(a.results)
-    for sub in ("dev", "train"):
-        (out / sub).mkdir(parents=True, exist_ok=True)
-        for p in (out / sub).glob("*"):
-            p.unlink()
+    (out / "dev").mkdir(parents=True, exist_ok=True)
+    for p in (out / "dev").glob("*"):
+        p.unlink()
+    # EXTRACT_APPEND=1: keep the training shards of earlier extractions, featurize new files only
+    files, prefix, consumed, kept = plan_train(out, Path(a.gen), os.environ.get("EXTRACT_APPEND", "0") == "1")
     res.mkdir(parents=True, exist_ok=True)
-    report = {}
+    report = {"kept_train_shards": kept, "files": [p.name for p in files]}
+    log(f"training files to featurize: {report['files']} ({kept} earlier shards kept)")
 
     t0 = time.time()
     tgt = Target(a.target)
@@ -139,10 +170,10 @@ def main():
     # 2. generated training sequences
     rng = random.Random(a.seed)
     gen = []
-    for d in DOMAINS:
-        p = Path(a.gen) / f"{d}.jsonl"
-        if p.exists():
-            for line in open(p):
+    for p in files:
+        d = p.name.split(".")[0].split("-")[0]
+        for line in open(p):
+            if line.strip():
                 r = json.loads(line)
                 if len(r["o"]) >= 8:
                     gen.append({"ids": r["p"] + r["o"], "P": len(r["p"]), "domain": d})
@@ -151,12 +182,14 @@ def main():
     agree = defaultdict(lambda: [0, 0])
     done = defaultdict(lambda: [0, 0])
     t0 = time.time()
+    complete = True
     for g in range(0, len(gen), a.group):
         if time.time() - t0 > a.minutes * 60:
             log("time budget reached")
+            complete = False
             break
         feats = featurize(tgt, gen[g:g + a.group], a.batch_tokens, agree)
-        save_shard(str(out / "train" / f"g{g // a.group:04d}"), feats)
+        save_shard(str(out / "train" / f"{prefix}{g // a.group:04d}"), feats)
         for f in feats:
             done[f["domain"]][0] += 1
             done[f["domain"]][1] += f["T"] - f["P"]
@@ -166,6 +199,8 @@ def main():
     report["train_sequences"] = {d: {"sequences": v[0], "generated_tokens": v[1]} for d, v in done.items()}
     report["train_teacher_forced_agreement"] = {d: round(v[0] / max(1, v[1]), 4) for d, v in agree.items()}
     report["extract_seconds"] = round(time.time() - t0, 1)
+    if complete:      # a file cut off by the time budget is not marked, so it is not skipped later
+        (out / "consumed_gen.json").write_text(json.dumps(sorted(consumed | {p.name for p in files})))
     (res / "extract_checks.json").write_text(json.dumps(report, indent=2))
     log(f"done: {report['train_sequences']}")
 

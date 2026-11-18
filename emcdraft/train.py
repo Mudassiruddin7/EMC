@@ -25,7 +25,7 @@ import torch.nn.functional as F
 
 from .head import (FP8_TENSORS, HeadConfig, build_head, e4m3_round, equalize_, export_submission,
                    load_mtp_state, load_target_tensors, unroll)
-from .sim import DOMAINS, batches, collate, load_shards, simulate
+from .sim import DOMAINS, batches, collate, load_shards, shards_bytes, simulate
 
 
 def log(msg):
@@ -135,13 +135,20 @@ def main():
     embed = lambda ids: F.embedding(ids, E)
     head = build_head(load_mtp_state(a.init), cfg, dev)
 
-    seqs = load_shards(a.data, dev)
-    train, val = split_val(seqs, 0.05, rng)
+    # hidden states stay on the GPU while they fit comfortably, otherwise in host memory and
+    # each batch is copied over (TRAIN_DATA_DEVICE=cpu|cuda overrides)
+    data_dev = os.environ.get("TRAIN_DATA_DEVICE") or ("cpu" if shards_bytes(a.data) > 24e9 else dev)
+    seqs = load_shards(a.data, data_dev)
+    # validation comes from the first extraction only, so with appended data it is the same
+    # hold-out set as in the earlier run (whose head may be the starting point here)
+    train, val = split_val([s for s in seqs if s["part"] == 1], 0.05, rng)
+    train += [s for s in seqs if s["part"] != 1]
     dev_seqs = load_shards(a.dev, dev) if a.dev and Path(a.dev).exists() else []
     tok_by = {d: sum(s["T"] - s["P"] for s in seqs if s["domain"] == d) for d in DOMAINS}
-    log(f"data: {len(train)} train / {len(val)} val sequences, generated tokens by domain {tok_by}")
+    log(f"data: {len(train)} train / {len(val)} val sequences (held on {data_dev}), "
+        f"generated tokens by domain {tok_by}")
     summary = {"args": vars(a), "data": {"train_sequences": len(train), "val_sequences": len(val),
-                                         "generated_tokens": tok_by}, "sim": {}}
+                                         "generated_tokens": tok_by, "data_device": data_dev}, "sim": {}}
 
     def sims(tag):
         r = {"val": simulate(head, embed, W, val)}
@@ -154,9 +161,9 @@ def main():
                f"steps {[round(x, 3) for x in r['dev']['step_accuracy']]}" if dev_seqs else ""))
         return r
 
-    sims("baseline")
+    sims("init")
     if a.qat:
-        probe = collate(val[:2])
+        probe = collate(val[:2], device=dev)
         with torch.no_grad():
             ref, _ = head.step(embed(probe[0][:, 1:]).float(), probe[1].float(),
                                torch.arange(probe[0].shape[1] - 1, device=dev)[None].expand(2, -1))
@@ -182,7 +189,7 @@ def main():
     total_steps = max(1, int(per_epoch * a.epochs))
     warm = max(5, total_steps // 30)
     key = "val"
-    best = {"tau": summary["sim"]["fp8_untrained" if a.qat else "baseline"][key]["acceptance_length"],
+    best = {"tau": summary["sim"]["fp8_untrained" if a.qat else "init"][key]["acceptance_length"],
             "step": 0, "state": {k: v.detach().clone() for k, v in head.state_dict().items()}}
     log(f"training: {total_steps} steps planned ({per_epoch}/epoch), qat={a.qat}")
     step, t0, hist = 0, time.time(), []
@@ -199,7 +206,7 @@ def main():
             f = (step + 1) / warm if step < warm else 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * (step - warm) / max(1, total_steps - warm)))
             for g in opt.param_groups:
                 g["lr"] = g["base"] * f
-            loss, info = train_step(head, embed, W, collate(group), a)
+            loss, info = train_step(head, embed, W, collate(group, device=dev), a)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
@@ -237,7 +244,7 @@ def main():
                                    "built-in head and fine-tuned with a 3-step recursive drafting objective"
                                    + (" and FP8 (E4M3) quantisation-aware training" if a.qat else "")),
             "training_data": ("Greedy answers of the target itself (with its hidden states) to public "
-                              "instruction prompts: GSM8K/MetaMathQA, WritingPrompts, UltraChat/Alpaca/Dolly, "
+                              "instruction prompts: GSM8K/Orca-Math, WritingPrompts, UltraChat/Alpaca/Dolly, "
                               "Python instruction sets; dev prompts excluded")}
     tcfg = Path(a.target) / "config.json"
     if a.qat:

@@ -32,24 +32,33 @@ def save_shard(stem: str, seqs: list[dict]):
     Path(stem + ".json").write_text(json.dumps(meta))
 
 
+def shards_bytes(data_dir) -> int:
+    return sum(p.stat().st_size for p in Path(data_dir).glob("*.hid.npy"))
+
+
 def load_shards(data_dir, device, max_tokens: int | None = None) -> list[dict]:
+    """Every sequence of the shards in `data_dir` (sorted by name), with the extraction part it
+    came from (shards g... are part 1, appended shards p<k>g... part k)."""
     seqs, total = [], 0
     for meta_path in sorted(Path(data_dir).glob("*.json")):
         stem = str(meta_path)[:-5]
+        name = meta_path.stem
+        part = int(name[1:name.index("g")]) if name.startswith("p") else 1
         meta = json.loads(meta_path.read_text())
         tok = torch.from_numpy(np.load(stem + ".tok.npy").astype(np.int64)).to(device)
         hid = torch.from_numpy(np.load(stem + ".hid.npy")).view(torch.bfloat16).to(device)
         to = ho = 0
         for T, P, dom, sid in zip(meta["T"], meta["P"], meta["domain"], meta["id"]):
             seqs.append({"tokens": tok[to:to + T], "hidden": hid[ho:ho + T - 1], "P": P, "T": T,
-                         "domain": dom, "id": sid})
+                         "domain": dom, "id": sid, "part": part})
             to, ho, total = to + T, ho + T - 1, total + T
         if max_tokens and total >= max_tokens:
             break
     return seqs
 
 
-def collate(seqs: list[dict], pad: int = 0):
+def collate(seqs: list[dict], pad: int = 0, device=None):
+    """Pad a group into (tokens, hidden, P, T); built where the data lives, then moved to `device`."""
     B, Tm = len(seqs), max(s["T"] for s in seqs)
     dev = seqs[0]["tokens"].device
     H = seqs[0]["hidden"].shape[-1]
@@ -60,6 +69,8 @@ def collate(seqs: list[dict], pad: int = 0):
         hidden[b, :s["T"] - 1] = s["hidden"]
     P = torch.tensor([s["P"] for s in seqs], device=dev)
     T = torch.tensor([s["T"] for s in seqs], device=dev)
+    if device is not None and torch.device(device) != torch.device(dev):
+        tokens, hidden, P, T = (x.to(device) for x in (tokens, hidden, P, T))
     return tokens, hidden, P, T
 
 
@@ -93,7 +104,7 @@ def simulate(head, embed, W, seqs: list[dict], K: int = 3, max_tokens: int = 120
     hit, tot = [0] * K, [0] * K
     cuda = W.is_cuda
     for group in batches(seqs, max_tokens):
-        tokens, hidden, P, T = collate(group)
+        tokens, hidden, P, T = collate(group, device=W.device)
         B, Tm = tokens.shape
         N = Tm - 1
         base = torch.arange(N, device=tokens.device)

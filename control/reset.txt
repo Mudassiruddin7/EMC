@@ -1,3 +1,4 @@
 # Requests to re-run pipeline stages on the GPU machine (read by scripts/supervise.py).
 # One per line: <unique id> [kill] <stage> [<stage> ...]   - each id is applied once;
 # "kill" stops a running pipeline first. Example:  r1-2 train eval_main
+r2 generate extract train eval_main report_main eval_alt report

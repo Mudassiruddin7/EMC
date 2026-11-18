@@ -197,6 +197,55 @@ def test_helpers():
         print("  supervisor branch lookup skipped (no network):", e)
 
 
+def test_append():
+    """Adding data to an earlier run: earlier answers and feature shards are kept, only new files
+    are processed, and validation still comes from the first extraction."""
+    from emcdraft.extract import plan_train
+    from emcdraft.gen_vllm import previous_outputs
+    from emcdraft.sim import load_shards, save_shard
+    from emcdraft.train import split_val
+
+    def shard(stem, n, d, seed):
+        g = torch.Generator().manual_seed(seed)
+        seqs = [{"tokens": torch.randint(0, V, (12,), generator=g), "hidden": torch.randn(11, C.hidden, generator=g),
+                 "P": 3, "domain": d, "id": f"{seed}-{i}"} for i in range(n)]
+        save_shard(str(stem), seqs)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        gen, data = Path(tmp) / "gen", Path(tmp) / "data"
+        gen.mkdir()
+        (gen / "chat.jsonl").write_text(json.dumps({"p": [1, 2], "o": [5, 6, 248046]}) + "\n")
+        (gen / "code.jsonl").write_text(json.dumps({"p": [3], "o": [7] * 9}) + "\n")
+        seen, stats, total, suffix = previous_outputs(gen)
+        assert seen["chat"] == {(1, 2)} and total == 12 and suffix == "-2" and stats["chat"]["stopped"] == 1
+
+        files, prefix, consumed, kept = plan_train(data, gen, append=False)        # first extraction
+        assert [p.name for p in files] == ["chat.jsonl", "code.jsonl"] and prefix == "g" and kept == 0
+        shard(data / "train" / "g0000", 20, "chat", 1)                             # (no consumed list, as in run 1)
+
+        (gen / "chat-2.jsonl").write_text(json.dumps({"p": [4], "o": [8] * 9}) + "\n")
+        assert previous_outputs(gen)[2] == 21 and previous_outputs(gen)[3] == "-3"
+        files, prefix, consumed, kept = plan_train(data, gen, append=True)
+        assert [p.name for p in files] == ["chat-2.jsonl"] and prefix == "p2g" and kept == 1, (files, prefix, kept)
+        shard(data / "train" / "p2g0000", 5, "chat", 2)
+        (data / "consumed_gen.json").write_text(json.dumps(sorted(consumed | {"chat-2.jsonl"})))
+        (gen / "code-3.jsonl").write_text(json.dumps({"p": [9], "o": [8] * 9}) + "\n")
+        files, prefix, _, kept = plan_train(data, gen, append=True)
+        assert [p.name for p in files] == ["code-3.jsonl"] and prefix == "p3g" and kept == 2
+
+        seqs = load_shards(data / "train", "cpu")
+        assert [s["part"] for s in seqs] == [1] * 20 + [2] * 5
+        first = [s for s in seqs if s["part"] == 1]
+        _, val_a = split_val(first, 0.05, random.Random(0))
+        _, val_b = split_val(load_shards(data / "train" , "cpu")[:20], 0.05, random.Random(0))
+        assert [s["id"] for s in val_a] == [s["id"] for s in val_b] and all(s["part"] == 1 for s in val_a)
+        t, h, P, T = collate(seqs[:3], device="cpu")
+        assert h.shape == (3, 11, C.hidden) and t.device.type == "cpu"
+        plan_train(data, gen, append=False)                                         # a fresh run clears the shards
+        assert not list((data / "train").glob("*"))
+    print("  append: earlier answers and shards kept, new files only, same validation split")
+
+
 if __name__ == "__main__":
     head = MTPHead(C)
     for p in head.parameters():
@@ -209,4 +258,5 @@ if __name__ == "__main__":
     print("walk"); test_walk()
     print("train/export"); test_train_and_export(head, E, W)
     print("helpers"); test_helpers()
+    print("append"); test_append()
     print("ALL OK")

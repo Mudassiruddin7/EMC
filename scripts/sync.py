@@ -91,13 +91,23 @@ def main():
                 api.upload_folder(folder_path=str(stage), repo_id=REPO_ID, repo_type="dataset",
                                   path_in_repo=f"runs/{run_id}", commit_message=f"Run {run_id}: logs and results")
                 print(f"uploaded logs/results to {REPO_ID}:runs/{run_id}")
-            if "--submissions" in sys.argv:
-                for sub in sorted(ROOT.glob("runs/*/sub_*")):
-                    name = f"{sub.parent.name}-{sub.name[4:]}"
-                    api.upload_folder(folder_path=str(sub), repo_id=REPO_ID, repo_type="dataset",
-                                      path_in_repo=f"submissions/{run_id}/{name}",
-                                      commit_message=f"Run {run_id}: draft model {name}")
-                    print(f"uploaded {sub.name} to {REPO_ID}:submissions/{run_id}/{name}")
+            # draft folders: all of them with --submissions, otherwise any whose files are not on
+            # the Hub yet (so finished weights get saved even if the machine stops early)
+            subs = sorted(p for p in ROOT.glob("runs/*/sub_*") if p.is_dir())
+            have = set()
+            if subs and "--submissions" not in sys.argv:
+                try:
+                    have = set(api.list_repo_files(REPO_ID, repo_type="dataset"))
+                except Exception as e:  # noqa: BLE001
+                    print(f"could not list the repository: {e}")
+            for sub in subs:
+                name = f"{sub.parent.name}-{sub.name[4:]}"
+                dest = f"submissions/{run_id}/{name}"
+                missing = [p.name for p in sub.iterdir() if p.is_file() and f"{dest}/{p.name}" not in have]
+                if "--submissions" in sys.argv or missing:
+                    info = api.upload_folder(folder_path=str(sub), repo_id=REPO_ID, repo_type="dataset",
+                                             path_in_repo=dest, commit_message=f"Run {run_id}: draft model {name}")
+                    print(f"uploaded {sub.name} to {REPO_ID}:{dest} ({info})")
         finally:
             shutil.rmtree(stage, ignore_errors=True)
     return 0
