@@ -59,9 +59,9 @@ before choosing it:
 * **Objective — the engine's drafting loop.** `emcdraft.head.unroll` runs all three draft steps
   for every position of a sequence in parallel, with exactly the key/value visibility the
   engine's draft cache has (verified prefix, then the round's own entries). Each step is
-  trained on the token the target really emitted; step 1 also distils the target's full
-  next-token distribution; later steps are weighted by whether the earlier ones were right,
-  because the engine only reaches them in that case.
+  trained on the token the target really emitted and also distils the target's full
+  distribution for that token; later steps are weighted by whether the earlier ones were
+  right, because the engine only reaches them in that case.
 * **FP8 with QAT.** An exact, function-preserving re-scaling (`equalize_`) first moves the big
   matrices into the range where E4M3 has relative precision; they are then trained through
   E4M3 rounding with a straight-through estimator, so the compact file is the model that was
@@ -75,8 +75,29 @@ before choosing it:
 
 ## Results
 
-Produced by `scripts/pipeline.sh`; raw kit outputs and logs are in `results/` and in the
-dataset repo. *(Filled in by the run — see `results/summary.md`.)*
+Official kit `eval` (vLLM 0.31.0, all 160 dev prompts, K = 3), every row measured in the same
+run on the same **NVIDIA RTX PRO 6000 Blackwell**:
+
+| draft | τ | chat / code / math / long-form | TPOT | memory | score, same GPU | score, published baseline |
+|---|---|---|---|---|---|---|
+| baseline (the target's built-in MTP head) | 2.806 | 3.06 / 3.74 / 3.64 / 2.37 | 15.39 ms | 0.917 GB | 100.0 | 96.2 |
+| this draft, bf16 | 2.885 | 3.07 / 3.75 / 3.70 / 2.48 | 15.31 ms | 0.917 GB | 102.3 | 98.5 |
+| **this draft, FP8 (submitted variant)** | **2.868** | 3.08 / 3.78 / 3.68 / 2.45 | 15.27 ms | **0.607 GB** | **114.4** | **110.7** |
+
+* *Score, same GPU* uses the baseline as measured above; *score, published baseline* is the
+  kit's own number, whose speed term compares against the organisers' TPOT from different
+  hardware (that is why the baseline itself gets 96.2 there).
+* The FP8 variant's same-GPU score splits into acceptance 1.034 (×0.5), memory 1.5 (×0.25,
+  the cap) and speed 1.008 (×0.25). Most of the gain is the compact storage; fine-tuning added
+  +0.06 to τ, mostly in long-form writing (+0.08) and math (+0.04).
+* The offline simulator predicted the dev acceptance within 0.015 of the engine (2.858 vs
+  2.868 for the FP8 draft, 2.792 vs 2.806 for the baseline).
+* Run r1 trained on 2.02 M generated tokens (4,820 answers) for 584 steps (13 min); its
+  validation τ was still rising when the schedule ended. Total GPU time for the whole pipeline,
+  including the three full evaluations: about 2.6 hours.
+
+Raw kit outputs, per-stage logs, machine statistics and the training summary are in the
+dataset repo under `runs/r1/`; the exported draft folders under `submissions/r1/`.
 
 ## Layout
 
@@ -101,7 +122,7 @@ tests/test_head.py    CPU self-test (FP8 codec, unroll vs. step-by-step emulatio
 
 ## Reproduce
 
-Linux, one GPU with at least 80 GB, about 110 GB of disk. In a Python shell or notebook on
+Linux, one GPU with at least 80 GB, about 120 GB of disk. In a Python shell or notebook on
 that machine:
 
 ```python
@@ -127,9 +148,16 @@ This starts `scripts/supervise.py`, which runs `scripts/pipeline.sh` stage by st
 | eval_main, eval_baseline, eval_alt | full official `eval` (160 dev prompts) of the draft, the baseline and the second variant |
 
 Every stage resumes after an interruption, and logs, kit results, generated data and the
-draft folders are pushed to the dataset repo as they are produced. The engine is the
-pinned version installed from PyPI rather than the container image; the results JSON records
-this. `python tests/test_head.py` runs the CPU self-test (no GPU, no downloads).
+draft folders are pushed to the dataset repo as they are produced. Settings in
+`control/run.env` extend a finished run instead of repeating it: `GEN_APPEND=1` and
+`EXTRACT_APPEND=1` keep earlier answers and features, `TRAIN_INIT` starts from an earlier
+head, `RUN_NAME` names the new training run.
+
+The engine is the pinned version installed from PyPI rather than the container image; the
+results JSON records this. The pipeline sets `VLLM_USE_FLASHINFER_SAMPLER=0`, so the engine
+uses its built-in sampler instead of compiling FlashInfer's at start-up; decoding is greedy,
+so outputs and draft behaviour are unaffected. `python tests/test_head.py` runs the CPU
+self-test (no GPU, no downloads).
 
 ## Submission format and rules
 
