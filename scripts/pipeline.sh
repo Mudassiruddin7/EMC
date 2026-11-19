@@ -72,7 +72,7 @@ s_env() {
   for d in "$UV_PYTHON_INSTALL_DIR"/cpython-3.12*; do
     if [ -d "$d" ] && [ ! -x "$d/bin/python3.12" ]; then echo "removing incomplete $d"; rm -rf "$UV_PYTHON_INSTALL_DIR"; break; fi
   done
-  if ! "$PY" -c "import sys" >/dev/null 2>&1; then rm -rf "$VENV"; "$UV" venv --python 3.12 "$VENV"; fi
+  if ! "$PY" -c "import sys" >/dev/null 2>&1; then rm -rf "$VENV" "$UV_CACHE_DIR"; "$UV" venv --python 3.12 "$VENV"; fi
   "$UV" pip install --python "$PY" "vllm==0.31.0" accelerate datasets
   "$UV" cache clean >/dev/null 2>&1 || true
   "$PY" - <<'EOF'
@@ -194,6 +194,30 @@ s_bench_target() { SUB="" bench --tag target_only --target-only --what batch,lon
 log "pipeline start: run $(cat "$STATE/run_id"), code $(cat "$REPO/.commit" 2>/dev/null | cut -c1-12), training run $RUN_NAME"
 # a vLLM server left behind by an interrupted run would still hold the GPU
 if pkill -f -- "--served-model-name target" 2>/dev/null; then log "stopped a leftover vLLM server"; sleep 20; fi
+# a machine change can keep the "done" markers but lose what the stages produced: check each
+# finished stage's output and run the stage again when it is gone
+check_done() {   # check_done <stage> <command ...>
+  local name=$1; shift
+  if is_done "$name" && ! "$@" >/dev/null 2>&1; then rm -f "$STATE/$name.done"; log "redo  $name (its output is missing)"; fi
+}
+has_files() { compgen -G "$1" >/dev/null; }
+shards_ok() {   # every shard listed by its metadata file is present and non-empty
+  local d=$1 j
+  has_files "$d/*.json" || return 1
+  for j in "$d"/*.json; do [ -s "${j%.json}.tok.npy" ] && [ -s "${j%.json}.hid.npy" ] || return 1; done
+}
+check_done env "$PY" -c "import vllm, torch, transformers"
+check_done download "$PY" -c "import json, os, sys; d = '$TARGET'; f = set(json.load(open(d + '/model.safetensors.index.json'))['weight_map'].values()); sys.exit(0 if os.path.isfile('$KIT/contract.json') and all(os.path.getsize(os.path.join(d, x)) > 0 for x in f) else 1)"
+check_done baseline test -s "$BASELINE/model.safetensors"
+check_done probe test -s "$PROBE/model.safetensors"
+check_done prompts has_files "$DATA/prompts/*.jsonl"
+check_done smoke_fp8 test -s "$RESULTS/smoke_fp8.json"
+check_done generate has_files "$DATA/gen/*.jsonl"
+check_done extract shards_ok "$DATA/train"
+check_done extract shards_ok "$DATA/dev"
+check_done train test -s "$OUTRUN/sub_bf16/model.safetensors"
+check_done eval_main test -s "$RESULTS/$(new_tag).json"
+check_done eval_baseline test -s "$RESULTS/eval_baseline.json"
 stage env 1 s_env
 stage download 1 s_download
 stage baseline 1 s_baseline

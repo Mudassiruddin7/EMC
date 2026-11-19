@@ -48,8 +48,16 @@ def remote_sha():
     return m.group(1) if m else None
 
 
+def complete(code_dir):
+    """A code snapshot is usable only with its commit stamp and the pipeline script (folders
+    can survive a machine change without their files)."""
+    return (code_dir / ".commit").is_file() and (code_dir / "scripts" / "pipeline.sh").is_file()
+
+
 def install(sha):
     dest = CODE / sha[:12]
+    if dest.exists() and not complete(dest):
+        shutil.rmtree(dest, ignore_errors=True)
     if not dest.exists():
         data = urllib.request.urlopen(f"https://codeload.github.com/{SOURCE}/tar.gz/{sha}", timeout=300).read()
         tmp = CODE / f".{sha[:12]}.tmp"
@@ -118,9 +126,12 @@ def stop(proc):
 
 def sync():
     if VENV_PY.exists() and (ROOT / "repo" / "scripts" / "sync.py").exists():
-        with open(LOGS / "sync.log", "a") as f:
-            subprocess.run([str(VENV_PY), str(ROOT / "repo" / "scripts" / "sync.py")], stdout=f,
-                           stderr=subprocess.STDOUT, env=dict(tool_env(), EMC_ROOT=str(ROOT)), timeout=1200)
+        try:
+            with open(LOGS / "sync.log", "a") as f:
+                subprocess.run([str(VENV_PY), str(ROOT / "repo" / "scripts" / "sync.py")], stdout=f,
+                               stderr=subprocess.STDOUT, env=dict(tool_env(), EMC_ROOT=str(ROOT)), timeout=1200)
+        except Exception as e:  # noqa: BLE001 - an upload problem never stops the supervisor
+            log(f"log push failed: {type(e).__name__}: {e}")
 
 
 def start_pipeline(extra):
@@ -141,7 +152,7 @@ def main():
     if os.environ.get("RUN_ID") and not (STATE / "run_id").exists():
         (STATE / "run_id").write_text(os.environ["RUN_ID"] + "\n")
     head = ROOT / "repo" / ".commit"
-    current = head.read_text().strip() if head.exists() else ""
+    current = head.read_text().strip() if complete(ROOT / "repo") else ""
     ran = (STATE / "pipeline_commit").read_text().strip() if (STATE / "pipeline_commit").exists() else ""
     # force: (re)start the pipeline once on every supervisor start - finished stages are skipped,
     # and a machine restart in the middle of a stage resumes there.
@@ -183,8 +194,16 @@ def main():
                 log(f"pipeline exited with code {proc.returncode}")
                 reported = True
                 sync()
-            if current and (current != ran or force) and (ROOT / "repo").exists():
-                proc = start_pipeline(env)
+            if current and not complete(ROOT / "repo"):
+                current = ""                      # snapshot lost its files: fetch it again next minute
+                log("code snapshot incomplete; reinstalling")
+            elif current and (current != ran or force):
+                try:
+                    proc = start_pipeline(env)
+                except Exception as e:  # noqa: BLE001 - retried next minute
+                    log(f"pipeline start failed: {type(e).__name__}: {e}")
+                    time.sleep(60)
+                    continue
                 ran, force, reported, last_sync = current, False, False, time.time()
                 (STATE / "pipeline_commit").write_text(current + "\n")
                 log(f"pipeline started (pid {proc.pid}) at {current[:12]}")

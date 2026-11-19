@@ -58,10 +58,16 @@ def get_uv(root):
 
 
 def alive(pidfile):
+    """True only if the recorded process exists and is our supervisor (a pid file left over
+    from an earlier machine can name an unrelated process)."""
     try:
-        os.kill(int(pidfile.read_text()), 0)
-        return True
+        pid = int(pidfile.read_text())
+        os.kill(pid, 0)
     except (OSError, ValueError):
+        return False
+    try:
+        return b"supervise.py" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
         return False
 
 
