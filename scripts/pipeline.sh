@@ -187,6 +187,12 @@ s_choose() {
 }
 bench() { env EMC_TARGET="$TARGET" EMC_SUB="${SUB:-}" EMC2_WORK="$WORK" "$PY" "$REPO/scripts/bench.py" "$@"; }
 final_sub() { if [ -f "$STATE/final_sub" ]; then cat "$STATE/final_sub"; else primary; fi; }
+s_fetch_final() {   # FINAL_SUB / FINAL_SUB_HF: the draft to measure when nothing is trained here
+  local d="$FINAL_SUB"; case "$d" in /*) ;; *) d="$EMC_ROOT/$d" ;; esac
+  [ -s "$d/model.safetensors" ] || { rm -rf "$d"; fetch_hf "$FINAL_SUB_HF" "$d"; }
+  SUB="$d" kit validate
+  echo "$d" > "$STATE/final_sub"
+}
 s_bench_draft() { SUB="$(final_sub)" bench --tag draft --what batch,long,k; }
 s_bench_baseline() { SUB="$BASELINE" bench --tag baseline --what batch,long; }
 s_bench_target() { SUB="" bench --tag target_only --target-only --what batch,long; }
@@ -221,6 +227,15 @@ check_done eval_baseline test -s "$RESULTS/eval_baseline.json"
 stage env 1 s_env
 stage download 1 s_download
 stage baseline 1 s_baseline
+if [ "${BENCH_ONLY:-0}" = 1 ]; then   # measurements of an already trained draft (fetched from the Hub)
+  stage fetch_final 1 s_fetch_final
+  stage bench_draft 0 s_bench_draft || true
+  stage bench_baseline 0 s_bench_baseline || true
+  stage bench_target 0 s_bench_target || true
+  stage report_bench 0 s_report || true
+  log "pipeline finished (measurements only)"
+  exit 0
+fi
 prompts_pid=""
 if ! is_done prompts; then (stage prompts 1 s_prompts) & prompts_pid=$!; fi
 stage checkenv 0 s_checkenv || true
