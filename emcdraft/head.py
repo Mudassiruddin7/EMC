@@ -266,13 +266,15 @@ def unroll(head: MTPHead, embed, tokens: torch.Tensor, hidden: torch.Tensor, K: 
     pos = base[None].expand(B, N)
     tri = torch.ones(N, N, dtype=torch.bool, device=dev).tril()
     eye = torch.eye(N, dtype=torch.bool, device=dev)
-    mem, hid = [], hidden
+    # heads with their own input fusion (EAGLE-3: auxiliary target states -> fc) apply it first
+    mem, hid = [], (head.combine(hidden) if hasattr(head, "combine") else hidden)
     for k in range(1, K + 1):
         tok_k = tokens[:, (base + k).clamp(max=T - 1)]
         mask = torch.cat([tri] + [eye] * (k - 1), 1)[None, None]
-        out, kv = head.step(embed(tok_k), hid, pos + (k - 1), mem, mask)
+        res = head.step(embed(tok_k), hid, pos + (k - 1), mem, mask)
+        out, kv = res[0], res[1]
         mem.append(kv)
-        hid = out
+        hid = res[2] if len(res) > 2 else out      # EAGLE-3 recurses on its pre-norm output
         yield k, out
 
 

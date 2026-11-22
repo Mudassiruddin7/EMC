@@ -112,13 +112,19 @@ def main():
         (root / ".scrub").write_text(os.environ["EMC_SCRUB"])
     if not alive(root / "supervisor.pid"):
         uv = get_uv(root)
-        req = urllib.request.Request(f"https://github.com/{SOURCE}.git/info/refs?service=git-upload-pack",
-                                     headers={"User-Agent": "git/2.45.0"})
-        sha = re.search(r"([0-9a-f]{40}) refs/heads/main", urllib.request.urlopen(req, timeout=30)
-                        .read().decode("latin-1")).group(1)
         sup = root / "supervise.py"
-        sup.write_bytes(urllib.request.urlopen(
-            f"https://raw.githubusercontent.com/{SOURCE}/{sha}/scripts/supervise.py", timeout=60).read())
+        if os.environ.get("EMC_CODE") == "hf":      # private repositories: code from the HF dataset repo
+            repo = os.environ.get("HF_REPO", "mudassiruddin21/EMC")
+            req = urllib.request.Request(f"https://huggingface.co/datasets/{repo}/resolve/main/scripts/supervise.py",
+                                         headers={"Authorization": f"Bearer {(root / '.hf_token').read_text().strip()}"})
+            sup.write_bytes(urllib.request.urlopen(req, timeout=60).read())
+        else:
+            req = urllib.request.Request(f"https://github.com/{SOURCE}.git/info/refs?service=git-upload-pack",
+                                         headers={"User-Agent": "git/2.45.0"})
+            sha = re.search(r"([0-9a-f]{40}) refs/heads/main", urllib.request.urlopen(req, timeout=30)
+                            .read().decode("latin-1")).group(1)
+            sup.write_bytes(urllib.request.urlopen(
+                f"https://raw.githubusercontent.com/{SOURCE}/{sha}/scripts/supervise.py", timeout=60).read())
         env = {k: v for k, v in os.environ.items() if k != "HF_TOKEN"}
         env.update(EMC_ROOT=str(root), UV=uv, RUN_ID=os.environ.get("RUN_ID", "r1"))
         with open(root / "logs" / "supervisor.log", "a") as out:

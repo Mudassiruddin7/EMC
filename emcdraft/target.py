@@ -70,3 +70,30 @@ class Target:
     @torch.no_grad()
     def hidden(self, ids: torch.Tensor) -> torch.Tensor:
         return self._forward(ids, self.mode)
+
+    def decoder_layers(self):
+        """The language model's decoder layers (a ModuleList as long as num_hidden_layers)."""
+        cfg = getattr(self.model.config, "text_config", None) or self.model.config
+        n = cfg.num_hidden_layers
+        found = [m for name, m in self.model.named_modules()
+                 if isinstance(m, torch.nn.ModuleList) and len(m) == n and name.endswith("layers")]
+        if not found:
+            raise RuntimeError("decoder layers not found")
+        return found[0]
+
+    def capture_aux(self, layer_ids):
+        """Record the residual stream after `layer_ids` layers (the engine's EAGLE-3 auxiliary
+        states: index i = after i decoder layers) on every forward pass; read with take_aux()."""
+        self._aux_ids = tuple(layer_ids)
+        self._aux = {}
+        layers = self.decoder_layers()
+        for i in self._aux_ids:
+            def hook(_mod, _inp, out, i=i):
+                self._aux[i] = (out[0] if isinstance(out, (tuple, list)) else out).detach()
+            layers[i - 1].register_forward_hook(hook)
+
+    def take_aux(self) -> torch.Tensor:
+        """[B, L, len(layer_ids) * H] from the last forward pass, in layer order."""
+        out = torch.cat([self._aux[i] for i in self._aux_ids], -1)
+        self._aux = {}
+        return out

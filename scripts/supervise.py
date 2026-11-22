@@ -12,7 +12,9 @@ the pipeline when it is not running and either the code changed or a reset asked
 
 While the pipeline runs, logs are pushed every 10 minutes. Create $EMC_ROOT/STOP to end it.
 """
+import hashlib
 import io
+import json
 import os
 import re
 import shutil
@@ -28,6 +30,11 @@ SOURCE = os.environ.get("EMC_SOURCE", "Mudassiruddin7/EMC")
 BRANCH = os.environ.get("EMC_BRANCH", "main")
 UV = os.environ.get("UV", "uv")
 LOGS, STATE, CODE = ROOT / "logs", ROOT / "state", ROOT / "code"
+# EMC_CODE=hf: take the code from the (private) Hugging Face dataset repo instead of GitHub
+CODE_SRC = os.environ.get("EMC_CODE", "github")
+HF_REPO = os.environ.get("HF_REPO", "mudassiruddin21/EMC")
+CODE_DIRS = ("emcdraft", "scripts", "control", "tests")
+_hf = {"commit": None, "files": []}
 VENV_PY = ROOT / "venv" / "bin" / "python"
 
 
@@ -40,7 +47,34 @@ def tool_env():
                 UV_LINK_MODE="copy", TMPDIR=str(ROOT / "tmp"), HF_HOME=str(ROOT / "hf"))
 
 
+def hf_token():
+    p = ROOT / ".hf_token"
+    return p.read_text().strip() if p.exists() else os.environ.get("HF_TOKEN", "")
+
+
+def hf_get(path):
+    req = urllib.request.Request(f"https://huggingface.co/{path}",
+                                 headers={"Authorization": f"Bearer {hf_token()}", "User-Agent": "emc-supervisor"})
+    return urllib.request.urlopen(req, timeout=120).read()
+
+
+def hf_code_version():
+    """A fingerprint of the code files only (the same repo also receives the run's logs, whose
+    uploads must not count as code changes), plus the commit to download them from."""
+    commit = json.loads(hf_get(f"api/datasets/{HF_REPO}/revision/main"))["sha"]
+    files = []
+    for d in CODE_DIRS:
+        for e in json.loads(hf_get(f"api/datasets/{HF_REPO}/tree/{commit}/{d}?recursive=true")):
+            if e.get("type") == "file":
+                files.append((e["path"], e["oid"]))
+    files.sort()
+    _hf.update(commit=commit, files=files)
+    return hashlib.sha1("\n".join(f"{p} {o}" for p, o in files).encode()).hexdigest()
+
+
 def remote_sha():
+    if CODE_SRC == "hf":
+        return hf_code_version()
     req = urllib.request.Request(f"https://github.com/{SOURCE}.git/info/refs?service=git-upload-pack",
                                  headers={"User-Agent": "git/2.45.0"})
     body = urllib.request.urlopen(req, timeout=30).read().decode("latin-1")
@@ -58,6 +92,16 @@ def install(sha):
     dest = CODE / sha[:12]
     if dest.exists() and not complete(dest):
         shutil.rmtree(dest, ignore_errors=True)
+    if not dest.exists() and CODE_SRC == "hf":
+        tmp = CODE / f".{sha[:12]}.tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        for path, _ in _hf["files"]:
+            f = tmp / path
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(hf_get(f"datasets/{HF_REPO}/resolve/{_hf['commit']}/{path}"))
+        (tmp / ".commit").write_text(sha + "\n")
+        tmp.rename(dest)
     if not dest.exists():
         data = urllib.request.urlopen(f"https://codeload.github.com/{SOURCE}/tar.gz/{sha}", timeout=300).read()
         tmp = CODE / f".{sha[:12]}.tmp"

@@ -67,8 +67,11 @@ def head_loss(o, W, y, w, teach, beta, chunk=2048, topk=0):
     return surrogate, ce_sum / float(denom), correct
 
 
-def train_step(head, embed, W, batch, a, K=3):
+def train_step(head, embed, W, batch, a, K=3, teacher=None):
+    """`teacher`: the target's final hidden states for the soft targets when `hidden` is not
+    them (EAGLE-3 consumes auxiliary layers instead)."""
     tokens, hidden, P, T = batch
+    src = hidden if teacher is None else teacher
     B, Tm = tokens.shape
     N = Tm - 1
     base = torch.arange(N, device=tokens.device)[None]
@@ -82,7 +85,7 @@ def train_step(head, embed, W, batch, a, K=3):
             w = valid.float() if prev is None else valid.float() * (a.floor + (1 - a.floor) * prev.float())
             bi, ni = valid.nonzero(as_tuple=True)
             # the target's own distribution for the same token: h_{i+k} predicts x_{i+k+1}
-            teach = hidden[bi, (ni + k).clamp(max=N - 1)] if a.beta > 0 else None
+            teach = src[bi, (ni + k).clamp(max=N - 1)] if a.beta > 0 else None
             s_k, ce_k, corr = head_loss(out[bi, ni], W, labels[bi, ni], w[bi, ni], teach, a.beta,
                                         topk=getattr(a, "topk", 0))
             total = total + getattr(a, "step_w_cur", a.step_w)[k - 1] * s_k

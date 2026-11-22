@@ -322,6 +322,96 @@ def test_recipes(head, E, W):
     print("  recipes: training options, recipe comparison and keep-the-better rule work end to end")
 
 
+def test_eagle(E, W):
+    """EAGLE-3 head: the batched unroll equals a literal emulation of the engine's drafting loop
+    (fused auxiliary states for step 1, pre-norm recursion afterwards); online training learns;
+    the export has exactly the names the engine's loader maps and passes the kit's validate;
+    the full-size draft stays inside the memory cap."""
+    from emcdraft.eagle import EagleConfig, Eagle3Head, OnlineTrainer, engine_config, export_eagle
+    from emcdraft.sim import collate, fp8_dequantize, fp8_quantize, load_shards, save_shard
+    torch.manual_seed(1)
+    cfg = EagleConfig(hidden=C.hidden, heads=4, kv_heads=2, head_dim=12, inter=64, aux_layers=(1, 2, 3), vocab=V)
+    head = Eagle3Head(cfg)
+    T = 12
+    tokens = torch.randint(0, V, (T,))
+    aux = torch.randn(T - 1, 3 * C.hidden)
+    with torch.no_grad():
+        par = [o for _, o in unroll(head, lambda ids: E[ids], tokens[None], aux[None], 3)]
+        worst = 0.0
+        for i in range(T - 1):
+            pos = torch.arange(i + 1)[None]
+            tri = torch.ones(i + 1, i + 1, dtype=torch.bool).tril()[None, None]
+            out, (ck, cv), pre = head.step(E[tokens[1:i + 2]][None], head.combine(aux[None, :i + 1]), pos, (), tri)
+            outs, h = [out[0, -1]], pre[:, -1:]
+            for k in range(2, 4):
+                if i + k > T - 1:
+                    break
+                o, kv, pre = head.step(E[tokens[i + k]][None, None], h, torch.tensor([[i + k - 1]]), [(ck, cv)],
+                                       torch.ones(1, 1, 1, ck.shape[2] + 1, dtype=torch.bool))
+                ck, cv = torch.cat([ck, kv[0]], 2), torch.cat([cv, kv[1]], 2)
+                outs.append(o[0, 0])
+                h = pre
+            for k, o in enumerate(outs):
+                worst = max(worst, float((par[k][0, i] - o).abs().max()))
+    assert worst < 1e-4, worst
+    print(f"  eagle unroll == step-by-step emulation with pre-norm recursion (max abs diff {worst:.2e})")
+
+    tr = OnlineTrainer(cfg, "cpu", total_steps=40, lr=3e-3, warmup=5)
+    toks = torch.randint(0, V, (4, 16))
+    ax, teach = torch.randn(4, 15, 3 * C.hidden), torch.randn(4, 15, C.hidden)
+    P, L = torch.tensor([3, 3, 4, 5]), torch.tensor([16, 14, 16, 12])
+    first = tr.step(lambda ids: F.embedding(ids, E), W, toks, ax, teach, P, L)["ce1"]
+    for _ in range(25):
+        last = tr.step(lambda ids: F.embedding(ids, E), W, toks, ax, teach, P, L)["ce1"]
+    assert last < first, (first, last)
+    print(f"  eagle online training: ce1 {first:.3f} -> {last:.3f}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        info = export_eagle(tr.head, Path(tmp) / "eagle", {"team_id": "t", "method_description": "m", "training_data": "d"})
+        from emcdraft.head import read_safetensors
+        names = set(read_safetensors(Path(tmp) / "eagle" / "model.safetensors"))
+        want = {"fc.weight", "fc_norm.0.weight", "fc_norm.1.weight", "fc_norm.2.weight", "norm.weight",
+                "midlayer.input_layernorm.weight", "midlayer.hidden_norm.weight", "midlayer.post_attention_layernorm.weight",
+                *(f"midlayer.self_attn.{x}_proj.weight" for x in "qkvo"),
+                *(f"midlayer.mlp.{x}_proj.weight" for x in ("gate", "up", "down"))}
+        assert names == want, names ^ want
+        cfgj = json.loads((Path(tmp) / "eagle" / "config.json").read_text())
+        assert cfgj["architectures"] == ["LlamaForCausalLMEagle3"] and cfgj["fc_norm"] is True
+        assert json.loads((Path(tmp) / "eagle" / "spec.json").read_text()) == {"method": "eagle3"}
+        kit = os.environ.get("EMC2_HOME")
+        if kit:
+            sys.path.insert(0, kit)
+            from emc2 import submission
+            errors, kinfo = submission.check(Path(tmp) / "eagle", json.loads((Path(kit) / "contract.json").read_text()),
+                                             json.loads((Path(kit) / "target.json").read_text()))
+            assert not errors, errors
+            assert kinfo["weight_bytes"] == info["weight_bytes"]
+        # FP8 feature shards: compact on disk, close to the original after batching
+        seqs = [{"tokens": torch.randint(0, V, (9,)), "hidden": (torch.randn(8, C.hidden) * 3).to(torch.bfloat16),
+                 "P": 2, "domain": "chat", "id": str(i)} for i in range(3)]
+        save_shard(str(Path(tmp) / "f8"), seqs, fp8=True)
+        assert (Path(tmp) / "f8.hid8.npy").exists() and not (Path(tmp) / "f8.hid.npy").exists()
+        back = load_shards(tmp, "cpu")
+        _, hb, _, _ = collate(back)
+        rel = float((hb.float() - torch.stack([s["hidden"].float() for s in seqs])).norm()
+                    / torch.stack([s["hidden"].float() for s in seqs]).norm())
+        assert rel < 0.05, rel
+        x = torch.randn(5, C.hidden)
+        assert float((fp8_dequantize(*fp8_quantize(x), dtype=torch.float32) - x).norm() / x.norm()) < 0.05
+    # the full-size draft against the memory cap (bf16 weights + KV cache at 16K tokens)
+    big = EagleConfig()
+    H, n = big.hidden, len(big.aux_layers)
+    params = (n * H * H + 2 * H * big.heads * big.head_dim + 2 * 2 * H * big.kv_heads * big.head_dim
+              + big.heads * big.head_dim * H + 3 * H * big.inter + (n + 4) * H)
+    memory = 2 * params + 1 * big.kv_heads * big.head_dim * 2 * 2 * 16384
+    assert 916507648 / memory >= 1.5, (params, memory)
+    from emcdraft.gen_vllm import share_from_env
+    sh = share_from_env("longform=0.6,chat=0.2,code=0.1,math=0.1")
+    assert abs(sh["longform"] - 0.6) < 1e-9 and abs(sum(sh.values()) - 1) < 1e-9
+    print(f"  eagle export: engine names, validate, FP8 shards (rel err {rel:.3f}); full size {params / 1e6:.0f} M params, "
+          f"memory {memory / 1e9:.3f} GB (ratio {916507648 / memory:.2f} >= 1.5)")
+
+
 if __name__ == "__main__":
     head = MTPHead(C)
     for p in head.parameters():
@@ -336,4 +426,5 @@ if __name__ == "__main__":
     print("helpers"); test_helpers()
     print("append"); test_append()
     print("recipes"); test_recipes(head, E, W)
+    print("eagle"); test_eagle(E, W)
     print("ALL OK")

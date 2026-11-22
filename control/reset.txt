@@ -4,3 +4,4 @@
 r2 generate extract train eval_main report_main eval_alt report
 r3 generate extract ablate train eval_main report_main eval_alt eval_prev choose report bench_draft bench_baseline bench_target report_bench
 r3m fetch_final bench_draft bench_baseline bench_target report_bench
+r4 fetch_gen generate extract eagle_eval train eval_main report_main eval_baseline report_baseline choose report

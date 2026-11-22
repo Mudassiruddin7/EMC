@@ -24,6 +24,9 @@ export XDG_CACHE_HOME="$WORK/cache" VLLM_CACHE_ROOT="$WORK/cache/vllm" VLLM_NO_U
 export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/inductor" TRITON_CACHE_DIR="$WORK/cache/triton"
 # greedy decoding only: use the built-in sampler instead of compiling FlashInfer kernels at start-up
 export VLLM_USE_FLASHINFER_SAMPLER=0
+# downloads from a private dataset repo (earlier answers, starting weights) need the token
+if [ -z "${HF_TOKEN:-}" ] && [ -s "$EMC_ROOT/.hf_token" ]; then HF_TOKEN="$(cat "$EMC_ROOT/.hf_token")"; export HF_TOKEN; fi
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 [ -f "$STATE/run_id" ] || echo "${RUN_ID:-$(date +%Y%m%d-%H%M)}" > "$STATE/run_id"
 if [ -n "${RUN_ID_FORCE:-}" ]; then echo "$RUN_ID_FORCE" > "$STATE/run_id"; fi   # e.g. a new run on a fresh machine
 # training run name (runs/<name>), its starting weights and whether to also evaluate the bf16 variant
@@ -131,8 +134,37 @@ EOF
 }
 s_smoke_base() { SUB="$BASELINE" TAG=smoke_baseline kit eval --limit-per-domain 2; }
 s_prompts()  { "$PY" -m emcdraft.prompts --target "$TARGET" --kit "$KIT" --out "$DATA/prompts" --results "$RESULTS"; }
+s_fetch_gen() {   # FETCH_GEN=<dataset-repo>:<folder>: answers generated in an earlier run, reused here
+  if [ -z "${FETCH_GEN:-}" ]; then echo "nothing to fetch"; return 0; fi
+  mkdir -p "$DATA/gen"
+  "$PY" - "$FETCH_GEN" "$DATA/gen" <<'PYEOF'
+import shutil, sys
+from pathlib import Path
+from huggingface_hub import snapshot_download
+repo, sub = sys.argv[1].split(":", 1)
+src = Path(snapshot_download(repo, repo_type="dataset", allow_patterns=[sub + "/*.jsonl"])) / sub
+n = 0
+for f in sorted(src.glob("*.jsonl")):
+    shutil.copyfile(f, Path(sys.argv[2]) / f.name)
+    n += sum(len(__import__("json").loads(line)["o"]) for line in open(f) if line.strip())
+print(f"fetched {sys.argv[1]}: {n} generated tokens")
+PYEOF
+}
 s_generate() { "$PY" -m emcdraft.gen_vllm --target "$TARGET" --prompts "$DATA/prompts" --out "$DATA/gen" --results "$RESULTS"; }
-s_extract()  { "$PY" -m emcdraft.extract --target "$TARGET" --kit "$KIT" --baseline "$BASELINE" --gen "$DATA/gen" --out "$DATA" --results "$RESULTS"; }
+s_extract()  {
+  local eagle=""; [ "${EAGLE:-0}" = 1 ] && eagle="--eagle-out $RUNS/eagle"
+  "$PY" -m emcdraft.extract --target "$TARGET" --kit "$KIT" --baseline "$BASELINE" --gen "$DATA/gen" --out "$DATA" --results "$RESULTS" $eagle
+  if [ -d "$RUNS/eagle/sub_bf16" ]; then cat "$STATE/run_id" > "$RUNS/eagle/run_id"; SUB="$RUNS/eagle/sub_bf16" kit validate; fi
+}
+s_eagle_eval() {   # the EAGLE-3 draft through the official eval: a quick check first, the full set if promising
+  if [ ! -d "$RUNS/eagle/sub_bf16" ]; then echo "no EAGLE-3 draft"; return 0; fi
+  SUB="$RUNS/eagle/sub_bf16" TAG=eagle_smoke kit eval --limit-per-domain 4
+  if "$PY" -c "import json, sys; m = json.load(open('$RESULTS/eagle_smoke.json')); sys.exit(0 if m['acceptance_length'] >= float('${EAGLE_FULL_MIN:-2.8}') else 1)"; then
+    SUB="$RUNS/eagle/sub_bf16" TAG=eval_eagle3 kit eval
+  else
+    echo "EAGLE-3 acceptance below ${EAGLE_FULL_MIN:-2.8} on the quick check: full evaluation skipped"
+  fi
+}
 fetch_hf() {   # fetch_hf <dataset-repo>:<folder> <destination>: a draft folder from the dataset repo
   "$PY" - "$1" "$2" <<'PYEOF'
 import shutil, sys
@@ -158,7 +190,7 @@ s_ablate() {   # short runs comparing training recipes; the best one is used by 
 }
 s_train() {
   local qat=""; [ -f "$STATE/fp8_ok" ] && qat="--qat"
-  local extra=""; [ -f "$STATE/train_args" ] && extra=$(cat "$STATE/train_args")
+  local extra="${TRAIN_ARGS:-}"; [ -z "$extra" ] && [ -f "$STATE/train_args" ] && extra=$(cat "$STATE/train_args")
   echo "training recipe: ${extra:-defaults}"
   init_weights
   rm -rf "$OUTRUN"
@@ -210,14 +242,15 @@ has_files() { compgen -G "$1" >/dev/null; }
 shards_ok() {   # every shard listed by its metadata file is present and non-empty
   local d=$1 j
   has_files "$d/*.json" || return 1
-  for j in "$d"/*.json; do [ -s "${j%.json}.tok.npy" ] && [ -s "${j%.json}.hid.npy" ] || return 1; done
+  for j in "$d"/*.json; do [ -s "${j%.json}.tok.npy" ] && { [ -s "${j%.json}.hid.npy" ] || [ -s "${j%.json}.hid8.npy" ]; } || return 1; done
 }
 check_done env "$PY" -c "import vllm, torch, transformers"
 check_done download "$PY" -c "import json, os, sys; d = '$TARGET'; f = set(json.load(open(d + '/model.safetensors.index.json'))['weight_map'].values()); sys.exit(0 if os.path.isfile('$KIT/contract.json') and all(os.path.getsize(os.path.join(d, x)) > 0 for x in f) else 1)"
 check_done baseline test -s "$BASELINE/model.safetensors"
 check_done probe test -s "$PROBE/model.safetensors"
 check_done prompts has_files "$DATA/prompts/*.jsonl"
-check_done smoke_fp8 test -s "$RESULTS/smoke_fp8.json"
+[ "${FP8_OK:-0}" = 1 ] || check_done smoke_fp8 test -s "$RESULTS/smoke_fp8.json"
+check_done fetch_gen has_files "$DATA/gen/*.jsonl"
 check_done generate has_files "$DATA/gen/*.jsonl"
 check_done extract shards_ok "$DATA/train"
 check_done extract shards_ok "$DATA/dev"
@@ -240,12 +273,17 @@ prompts_pid=""
 if ! is_done prompts; then (stage prompts 1 s_prompts) & prompts_pid=$!; fi
 stage checkenv 0 s_checkenv || true
 stage probe 0 s_probe || true
+if [ "${FP8_OK:-0}" = 1 ] && ! is_done smoke_fp8; then   # FP8 loading already verified in earlier runs
+  echo "1.0" > "$STATE/fp8_ok"; echo 0 > "$STATE/smoke_fp8.done"; log "skip  smoke_fp8 (FP8_OK=1)"
+fi
 if is_done probe; then stage smoke_fp8 0 s_smoke_fp8 || true; fi
 if ! is_done smoke_fp8; then stage smoke_base 1 s_smoke_base; fi   # engine itself must work
 if [ -n "$prompts_pid" ]; then wait "$prompts_pid"; fi
 is_done prompts || { log "stopping: prompts failed"; exit 1; }
+stage fetch_gen 1 s_fetch_gen
 stage generate 1 s_generate
 stage extract 1 s_extract
+stage eagle_eval 0 s_eagle_eval || true
 stage ablate 0 s_ablate || true
 stage train 1 s_train
 sync_hf --submissions

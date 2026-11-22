@@ -20,6 +20,18 @@ from pathlib import Path
 from .prompts import DOMAINS, MAX_NEW
 
 SHARE = {"longform": 0.45, "chat": 0.22, "code": 0.15, "math": 0.18}   # of generated tokens
+
+
+def share_from_env(text: str | None) -> dict:
+    """GEN_SHARE="longform=0.6,chat=0.2,code=0.1,math=0.1" overrides the domain mix."""
+    share = dict(SHARE)
+    for part in (text or "").split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if k.strip() in share:
+                share[k.strip()] = float(v)
+    total = sum(share.values())
+    return {k: v / total for k, v in share.items()}
 MEAN_LEN = {"chat": 383, "code": 270, "math": 309, "longform": 938}     # dev reference means
 STOP_IDS = [248046, 248044]
 
@@ -93,11 +105,13 @@ def main():
         total, suffix = 0, ""
     previous = total
 
+    share = share_from_env(os.environ.get("GEN_SHARE"))
+    log(f"domain mix of the token budget: { {d: round(v, 3) for d, v in share.items()} }")
     items = []
     for d in DOMAINS:
         pool = [json.loads(line)["ids"] for line in open(Path(a.prompts) / f"{d}.jsonl") if line.strip()]
         rng.shuffle(pool)
-        want = math.ceil(1.1 * a.tokens * SHARE[d] / MEAN_LEN[d])
+        want = math.ceil(1.1 * a.tokens * share[d] / MEAN_LEN[d])
         new = [(d, ids) for ids in pool[:want] if tuple(ids) not in seen[d]]
         items += new
         log(f"{d}: {len(new)} new prompts (pool {len(pool)}, {len(seen[d])} answered before)")
